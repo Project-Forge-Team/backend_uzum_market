@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -o errexit
 
-pip install -r requirements.txt
+# Устанавливаем зависимости
+pip install -r requirements/requirements.txt
+
+# Собираем статику
 python manage.py collectstatic --no-input
+
+# Применяем миграции
 python manage.py migrate

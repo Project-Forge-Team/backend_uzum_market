@@ -210,18 +210,19 @@ Accept: application/json
 
 **GET** `/products/`
 
-| Параметр      | Тип     | Обяз.  | Описание                                    |
-| ------------- | ------- | ------ | ------------------------------------------- |
-| `page`        | integer | ❌ нет | Номер страницы пагинации (по умолчанию `1`) |
-| `page_size`   | integer | ❌ нет | Количество товаров на странице              |
-| `category_id` | integer | ❌ нет | Фильтр по ID категории                      |
-| `seller_id`   | integer | ❌ нет | Фильтр по ID продавца                       |
-| `search`      | string  | ❌ нет | Поиск по названию товара                    |
+| Параметр    | Тип     | Обяз.  | Описание                                                                         |
+| ----------- | ------- | ------ | -------------------------------------------------------------------------------- |
+| `page`      | integer | ❌ нет | Номер страницы пагинации (по умолчанию `1`)                                      |
+| `page_size` | integer | ❌ нет | Количество товаров на странице (по умолчанию `10`)                               |
+| `category`  | integer | ❌ нет | Фильтр по ID категории                                                           |
+| `seller`    | integer | ❌ нет | Фильтр по ID продавца                                                            |
+| `search`    | string  | ❌ нет | Поиск по названию и описанию товара                                              |
+| `ordering`  | string  | ❌ нет | Сортировка: `price`, `rating`, `created_at` (с `-` для убывания, напр. `-price`) |
 
 **Пример запроса:**
 
 ```http
-GET /api/products/?category_id=1&search=phone&page=1&page_size=10 HTTP/1.1
+GET /api/products/?category=1&search=phone&ordering=-price&page=1 HTTP/1.1
 Host: backend-uzum-market.onrender.com
 Accept: application/json
 ```
