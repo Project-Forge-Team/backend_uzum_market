@@ -4,10 +4,82 @@ from django.db import IntegrityError
 from apps.products.models import Category, Seller, Product
 
 
+def fix_encoding():
+    """
+    Исправляет битую кодировку на проде.
+    Данные были залиты как UTF-8-байты, прочитанные как Latin-1.
+    Чтобы исправить: читаем как latin-1 → кодируем в utf-8 → сохраняем.
+    """
+    from django.db import models
+
+    def fix_text(obj, fields):
+        changed = False
+        for field_name in fields:
+            value = getattr(obj, field_name, None)
+            if value is None or not isinstance(value, str):
+                continue
+            try:
+                # Если строка содержит битые символы, исправляем
+                fixed = value.encode('latin-1').decode('utf-8')
+                if fixed != value:
+                    setattr(obj, field_name, fixed)
+                    changed = True
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                pass  # Не трогать, если не удаётся исправить
+        return changed
+
+    # --- Категории ---
+    for cat in Category.objects.all():
+        if fix_text(cat, ['name']):
+            cat.save(update_fields=['name'])
+
+    # --- Продавцы ---
+    for seller in Seller.objects.all():
+        if fix_text(seller, ['name']):
+            seller.save(update_fields=['name'])
+
+    # --- Товары ---
+    for product in Product.objects.all():
+        if fix_text(product, ['title', 'description', 'delivery_time']):
+            product.save(update_fields=['title', 'description', 'delivery_time'])
+        # characteristics — JSON, нужно исправить внутри
+        chars = product.characteristics
+        if isinstance(chars, dict):
+            new_chars = {}
+            for key, val in chars.items():
+                try:
+                    fixed_key = key.encode('latin-1').decode('utf-8')
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    fixed_key = key
+                if isinstance(val, str):
+                    try:
+                        fixed_val = val.encode('latin-1').decode('utf-8')
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        fixed_val = val
+                else:
+                    fixed_val = val
+                new_chars[fixed_key] = fixed_val
+            if new_chars != chars:
+                product.characteristics = new_chars
+                product.save(update_fields=['characteristics'])
+
+
 class Command(BaseCommand):
     help = 'Заполняет БД тестовыми данными (категории, продавцы, товары)'
 
     def handle(self, *args, **options):
+        # 1. Всегда исправляем кодировку
+        self.stdout.write('>>> Исправление кодировки...')
+        try:
+            fix_encoding()
+            self.stdout.write(self.style.SUCCESS('Кодировка исправлена.'))
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f'Ошибка кодировки: {e}'))
+
+        # 2. Если товары уже есть — пропускаем заполнение
+        if Product.objects.exists():
+            self.stdout.write(self.style.WARNING('Данные уже существуют — пропуск.'))
+            return
         # Если товары уже есть — пропускаем
         if Product.objects.exists():
             self.stdout.write(self.style.WARNING('Данные уже существуют — пропуск.'))
