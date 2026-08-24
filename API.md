@@ -20,23 +20,267 @@
 
 ---
 
-## 🔐 Авторизация
+## 🔐 Авторизация (JWT)
 
-На текущем этапе API **не требует авторизации** — все эндпоинты публичные.
+API использует **JWT-токены** для защиты приватных эндпоинтов (корзина, заказы, избранное, профиль).
 
-> **Примечание:** Если в будущем будет добавлена JWT-аутентификация, токен передаётся так:
->
-> ```
-> Authorization: Bearer <access_token>
-> ```
+### Как получить токен
+
+1. Зарегистрируйся: `POST /api/auth/register/` → получишь `access` и `refresh` токены
+2. Или залогинься: `POST /api/auth/login/` → получишь `access` и `refresh` токены
+
+### Как передавать токен
+
+Добавь заголовок `Authorization` к каждому защищённому запросу:
+
+```
+Authorization: Bearer <access_token>
+```
+
+### Время жизни токенов
+
+| Токен     | Время жизни |
+| --------- | ----------- |
+| `access`  | 60 минут    |
+| `refresh` | 7 дней      |
+
+Когда `access` истекает — отправь `refresh` на `/api/auth/refresh/` и получи новый `access` (и новый `refresh`, т.к. включён `ROTATE_REFRESH_TOKENS`).
 
 ---
 
 ## 📚 Содержание
 
+- [0. Аутентификация / JWT](#0-аутентификация--jwt)
 - [1. Категории](#1-категории)
 - [2. Продавцы](#2-продавцы)
 - [3. Товары](#3-товары)
+
+---
+
+## 0. Аутентификация / JWT
+
+### 0.1. Регистрация
+
+**POST** `/auth/register/` — создание нового аккаунта.
+
+| Параметр     | Тип    | Обяз.  | Описание                                |
+| ------------ | ------ | ------ | --------------------------------------- |
+| `email`      | string | ✅ да  | Email (уникальный, регистронезависимый) |
+| `password`   | string | ✅ да  | Пароль (мин. сложность)                 |
+| `password2`  | string | ✅ да  | Подтверждение пароля                    |
+| `first_name` | string | ❌ нет | Имя                                     |
+| `last_name`  | string | ❌ нет | Фамилия                                 |
+| `phone`      | string | ❌ нет | Телефон                                 |
+
+**Пример запроса:**
+
+```http
+POST /api/auth/register/ HTTP/1.1
+Host: backend-uzum-market.onrender.com
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "user@example.com",
+  "password": "StrongPass123!",
+  "password2": "StrongPass123!",
+  "first_name": "Иван",
+  "last_name": "Петров",
+  "phone": "+998901234567"
+}
+```
+
+**Ответ `201 Created`:**
+
+```json
+{
+  "user": {
+    "id": 1,
+    "email": "user@example.com",
+    "first_name": "Иван",
+    "last_name": "Петров",
+    "phone": "+998901234567"
+  },
+  "refresh": "eyJhbGciOiJIUzI1NiIs...",
+  "access": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+**Ответ `400 Bad Request`** (email уже занят):
+
+```json
+{
+  "email": ["Пользователь с таким email уже существует."]
+}
+```
+
+**Ответ `400 Bad Request`** (пароли не совпадают):
+
+```json
+{
+  "password2": ["Пароли не совпадают."]
+}
+```
+
+---
+
+### 0.2. Логин
+
+**POST** `/auth/login/` — вход по email и паролю.
+
+| Параметр   | Тип    | Обяз. | Описание           |
+| ---------- | ------ | ----- | ------------------ |
+| `email`    | string | ✅ да | Email пользователя |
+| `password` | string | ✅ да | Пароль             |
+
+**Пример запроса:**
+
+```http
+POST /api/auth/login/ HTTP/1.1
+Host: backend-uzum-market.onrender.com
+Content-Type: application/json
+Accept: application/json
+
+{
+  "email": "user@example.com",
+  "password": "StrongPass123!"
+}
+```
+
+**Ответ `200 OK`:**
+
+```json
+{
+  "refresh": "eyJhbGciOiJIUzI1NiIs...",
+  "access": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+**Ответ `401 Unauthorized`** (неверные данные):
+
+```json
+{
+  "detail": "No active account found with the given credentials"
+}
+```
+
+---
+
+### 0.3. Обновление токена
+
+**POST** `/auth/refresh/` — получить новый `access` по `refresh`.
+
+| Параметр  | Тип    | Обяз. | Описание      |
+| --------- | ------ | ----- | ------------- |
+| `refresh` | string | ✅ да | Refresh-токен |
+
+**Пример запроса:**
+
+```http
+POST /api/auth/refresh/ HTTP/1.1
+Host: backend-uzum-market.onrender.com
+Content-Type: application/json
+
+{
+  "refresh": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+**Ответ `200 OK`:**
+
+```json
+{
+  "access": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+> ⚠️ Возвращается и новый `refresh`, т.к. включён `ROTATE_REFRESH_TOKENS`. Старый refresh-токен перестаёт работать.
+
+**Ответ `401 Unauthorized`** (просрочен/невалидный refresh):
+
+```json
+{
+  "detail": "Token is invalid or expired",
+  "code": "token_not_valid"
+}
+```
+
+---
+
+### 0.4. Проверка токена
+
+**POST** `/auth/verify/` — проверить валидность `access`-токена.
+
+| Параметр | Тип    | Обяз. | Описание     |
+| -------- | ------ | ----- | ------------ |
+| `token`  | string | ✅ да | Access-токен |
+
+**Пример запроса:**
+
+```http
+POST /api/auth/verify/ HTTP/1.1
+Host: backend-uzum-market.onrender.com
+Content-Type: application/json
+
+{
+  "token": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+**Ответ `200 OK`** (токен валиден):
+
+```json
+{}
+```
+
+**Ответ `401 Unauthorized`** (токен невалиден):
+
+```json
+{
+  "detail": "Token is invalid or expired",
+  "code": "token_not_valid"
+}
+```
+
+---
+
+### 0.5. Профиль текущего пользователя
+
+**GET** `/auth/me/` — данные авторизованного пользователя.
+
+| Параметр | Тип | Обяз. | Описание               |
+| -------- | --- | ----- | ---------------------- |
+| —        | —   | —     | Требуется Bearer-токен |
+
+**Пример запроса:**
+
+```http
+GET /api/auth/me/ HTTP/1.1
+Host: backend-uzum-market.onrender.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+Accept: application/json
+```
+
+**Ответ `200 OK`:**
+
+```json
+{
+  "id": 1,
+  "email": "user@example.com",
+  "first_name": "Иван",
+  "last_name": "Петров",
+  "phone": "+998901234567"
+}
+```
+
+**Ответ `401 Unauthorized`** (без токена):
+
+```json
+{
+  "detail": "Authentication credentials were not provided."
+}
+```
 
 ---
 
@@ -338,14 +582,19 @@ Accept: application/json
 
 ## 📋 Сводная таблица эндпоинтов
 
-| #   | Метод | Путь                | Авторизация | Описание              |
-| --- | ----- | ------------------- | ----------- | --------------------- |
-| 1   | GET   | `/categories/`      | Public      | Список всех категорий |
-| 2   | GET   | `/categories/{id}/` | Public      | Детали категории      |
-| 3   | GET   | `/sellers/`         | Public      | Список всех продавцов |
-| 4   | GET   | `/sellers/{id}/`    | Public      | Детали продавца       |
-| 5   | GET   | `/products/`        | Public      | Список всех товаров   |
-| 6   | GET   | `/products/{id}/`   | Public      | Детали товара         |
+| #   | Метод | Путь                | Авторизация | Описание                      |
+| --- | ----- | ------------------- | ----------- | ----------------------------- |
+| 1   | POST  | `/auth/register/`   | Public      | Регистрация пользователя      |
+| 2   | POST  | `/auth/login/`      | Public      | Логин (получить токены)       |
+| 3   | POST  | `/auth/refresh/`    | Public      | Обновить access-токен         |
+| 4   | POST  | `/auth/verify/`     | Public      | Проверить валидность токена   |
+| 5   | GET   | `/auth/me/`         | Bearer      | Профиль текущего пользователя |
+| 6   | GET   | `/categories/`      | Public      | Список всех категорий         |
+| 7   | GET   | `/categories/{id}/` | Public      | Детали категории              |
+| 8   | GET   | `/sellers/`         | Public      | Список всех продавцов         |
+| 9   | GET   | `/sellers/{id}/`    | Public      | Детали продавца               |
+| 10  | GET   | `/products/`        | Public      | Список всех товаров           |
+| 11  | GET   | `/products/{id}/`   | Public      | Детали товара                 |
 
 ---
 
@@ -413,14 +662,8 @@ Accept: application/json
 
 В следующих версиях планируется добавить:
 
-- **Аутентификация** — JWT (djangorestframework-simplejwt)
-- **Пользователь** — регистрация, профиль
 - **Корзина** — добавление/удаление товаров
 - **Заказы** — оформление, статусы
 - **Избранное** — добавление товаров в избранное
 - **Отзывы** — создание отзывов на товары
 - **Write-эндпоинты** — POST/PUT/PATCH для создания и обновления данных (категории, продавцы, товары)
-
-```
-
-```

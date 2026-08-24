@@ -9,7 +9,8 @@ from drf_spectacular.views import (
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include('apps.products.urls')),  # API будет доступно по /api/products/
+    path('api/', include('apps.products.urls')),  # /api/products/, /api/categories/, /api/sellers/
+    path('api/auth/', include('apps.users.urls')),  # /api/auth/register/, /api/auth/login/, ...
 
     # Документация API
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
