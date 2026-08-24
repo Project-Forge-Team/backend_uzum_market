@@ -22,11 +22,14 @@ User = get_user_model()
 import os
 email = os.environ['DJANGO_SUPERUSER_EMAIL']
 if not User.objects.filter(email=email).exists():
-    User.objects.create_superuser(
+    user = User.objects.create_user(
         email=email,
         password=os.environ['DJANGO_SUPERUSER_PASSWORD'],
         first_name=os.environ.get('DJANGO_SUPERUSER_FIRST_NAME', 'Admin'),
     )
+    user.is_staff = True
+    user.is_superuser = True
+    user.save()
     print('Суперюзер создан:', email)
 else:
     print('Суперюзер уже существует:', email)
