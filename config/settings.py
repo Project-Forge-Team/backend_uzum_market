@@ -64,6 +64,11 @@ CORS_ALLOWED_ORIGINS = get_env_list(
     'CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000'
 )
 
+# Cookie settings для локалки (HTTP) — Secure=False, чтобы браузер сохранял cookies
+# На продакшене (DEBUG=False) эти значения переключаются на True
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+
 ROOT_URLCONF = 'config.urls'
 
 TEMPLATES = [
@@ -205,6 +210,15 @@ SIMPLE_JWT = {
     'ROTATE_REFRESH_TOKENS': False,
     'AUTH_HEADER_TYPES': ('Bearer',),
     'BLACKLIST_AFTER_ROTATION': True,
+    # Cookie settings (для совместимости с SimpleJWT)
+    'AUTH_COOKIE': 'uzum_access_token',
+    'REFRESH_COOKIE': 'uzum_refresh_token',
+    'AUTH_COOKIE_SECURE': not DEBUG,
+    'AUTH_COOKIE_HTTP_ONLY': True,
+    'AUTH_COOKIE_SAMESITE': 'Lax',
+    'REFRESH_COOKIE_SAMESITE': 'Lax',
+    'AUTH_COOKIE_PATH': '/',
+    'REFRESH_COOKIE_PATH': '/api/auth/',
 }
 
 
