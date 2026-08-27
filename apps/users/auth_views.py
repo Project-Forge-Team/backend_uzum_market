@@ -26,7 +26,9 @@ class CookieTokenObtainPairView(TokenObtainPairView):
         access_token = str(serializer.validated_data["access"])
         refresh_token = str(serializer.validated_data["refresh"])
 
-        user_data = UserSerializer(serializer.validated_data["user"]).data
+        user_data = UserSerializer(
+            serializer.validated_data["user"], context={"request": request}
+        ).data
 
         response = Response(user_data, status=200)
 
