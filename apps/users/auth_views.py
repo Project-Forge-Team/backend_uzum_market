@@ -26,9 +26,7 @@ class CookieTokenObtainPairView(TokenObtainPairView):
         access_token = str(serializer.validated_data["access"])
         refresh_token = str(serializer.validated_data["refresh"])
 
-        user_data = UserSerializer(
-            serializer.validated_data["user"], context={"request": request}
-        ).data
+        user_data = UserSerializer(serializer.user, context={"request": request}).data
 
         response = Response(user_data, status=200)
 
@@ -53,12 +51,6 @@ class CookieTokenObtainPairView(TokenObtainPairView):
             samesite="Lax",
             path="/api/auth/",
         )
-
-        # Убираем токены из тела ответа
-        if "access" in response.data:
-            del response.data["access"]
-        if "refresh" in response.data:
-            del response.data["refresh"]
 
         return response
 
