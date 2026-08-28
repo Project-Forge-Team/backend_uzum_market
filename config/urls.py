@@ -1,32 +1,23 @@
+from django.conf import settings
 from django.contrib import admin
-from django.urls import path, include
-from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
-from rest_framework.routers import DefaultRouter
-from apps.products.views import ProductViewSet, CategoryViewSet, SellerViewSet
-
-# Роутер для корня /api/ — категории и продукты без префикса /products/
-router = DefaultRouter()
-router.register(r'products', ProductViewSet, basename='product')
-router.register(r'categories', CategoryViewSet, basename='category')
-router.register(r'sellers', SellerViewSet, basename='seller')
+from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    # Auth: login, refresh, logout, register, me
-    path("api/auth/", include("apps.users.auth_urls")),
-    # Products + Categories + Sellers на корне /api/
-    path("api/", include(router.urls)),
-    # Swagger
+    # Auth: register, login, refresh, logout, csrf, me
+    path("api/auth/", include("apps.users.urls")),
+    # Каталог: products / categories / sellers (роутер объявлен один раз — в apps.products.urls)
+    path("api/", include("apps.products.urls")),
+    # OpenAPI + UI
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
-    path(
-        "api/schema/swagger-ui/",
-        SpectacularSwaggerView.as_view(url_name="schema"),
-        name="swagger-ui",
-    ),
-    # Совместимость со старым путём /api/docs/
-    path(
-        "api/docs/",
-        SpectacularSwaggerView.as_view(url_name="schema"),
-        name="docs",
-    ),
+    path("api/schema/swagger-ui/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/schema/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
+    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="docs"),
 ]
+
+if settings.DEBUG or settings.SERVE_MEDIA:
+    from django.conf.urls.static import static
+
+    # Без этого /media/ отдавало 404 даже локально (WhiteNoise обслуживает только статику).
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

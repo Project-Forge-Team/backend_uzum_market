@@ -1,0 +1,5 @@
+# Инструменты разработки/CI. Ставить поверх основных:
+#   pip install -r requirements/requirements.txt -r requirements/requirements-dev.txt
+-r requirements.txt
+
+ruff==0.16.5
