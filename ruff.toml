@@ -1,0 +1,32 @@
+# Конфиг ruff: линтер + форматтер (CI гоняет обе команды).
+line-length = 120
+target-version = "py312"
+extend-exclude = ["*/migrations/*", "staticfiles", ".venv", "venv"]
+
+[lint]
+select = [
+    "E4", "E7", "E9", "F",    # pycodestyle (разумное) + pyflakes
+    "I",                      # порядок импортов
+    "UP",                     # modern python
+    "B",                      # bugbear: реальные ловушки (mutable default, shadowing, ...)
+    "C4",                     # comprehensions
+    "S",                      # безопасность
+    "DJ",                     # django-специфика
+    "RUF",
+]
+ignore = [
+    "RUF001",  # «ambiguous unicode» в комментариях: проект русскоязычный, это шум
+    "RUF002",
+    "RUF003",
+    "RUF012",  # mutable class default: в DRF/Django это идиома (fields = [...], Meta)
+    "S101",    # assert в тестах и не только — оставляем на усмотрение
+    "DJ001",   # blank=True на CharField: у phone/first_name это осознанно
+]
+
+[lint.per-file-ignores]
+"*/tests.py" = ["S105", "S106", "B011"]
+"config/test_settings.py" = ["F401", "F403", "E402"]
+"manage.py" = ["EXE001"]
+
+[format]
+quote-style = "double"
