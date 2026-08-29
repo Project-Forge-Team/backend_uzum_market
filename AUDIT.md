@@ -821,7 +821,7 @@ class AuthTests(TestCase):
 ## ✅ Резолюция: что исправлено (v1.2.0, 2026-08-28)
 
 Все пункты закрыты; против каждого — тест, чтобы баг не вернулся. Проверки в репозитории:
-`python manage.py test --settings=config.test_settings` (46 тестов), `ruff check`,
+`python manage.py test --settings=config.test_settings` (59 тестов), `ruff check`,
 `manage.py check --deploy`, `makemigrations --check`, `spectacular --validate --fail-on-warn`.
 
 | # | Проблема | Что сделано | Где закреплено тестом |
@@ -850,9 +850,77 @@ class AuthTests(TestCase):
 | D-5 | N+1 в админке | `list_select_related`, `annotate(Count)` для счётчика, `list_per_page`, `date_hierarchy`, `search_fields` | — |
 | D-6 | Модель БД | `rating` → `Decimal(3,2)`, `price` → `Decimal(12,2)`, `MinValueValidator` + `CheckConstraint` (цена ≥ 0, рейтинг 0–5), `updated_at`, `related_name`, `phone`-валидатор | `test_rating_and_price_are_strings_of_exact_decimal` |
 | E-1 | Мёртвый код | Удалены `apps/users/views.py`, `apps/users/auth_urls.py`, `data.txt`, корневой `migrations/`; роутер каталога теперь объявлен один раз (`apps/products/urls.py`) | — |
-| E-2 | 0 тестов | 46 тестов в `apps/*/tests.py` + `config/test_settings.py` (sqlite in-memory, без внешней БД) | `manage.py test` |
+| E-2 | 0 тестов | 59 тестов в `apps/*/tests.py` + `config/test_settings.py` (sqlite in-memory, без внешней БД) | `manage.py test` |
 | E-3 | Нет CI/линтеров | `ci.yml` в корне репозитория (активируется `git mv ci.yml .github/workflows/ci.yml`; файл не пушился в `.github/` из-за прав GitHub-приложения) — check, миграции, OpenAPI, тесты, ruff + `ruff.toml` + `requirements/requirements-dev.txt` | CI |
 | C-3b | Ошибки не логировались | `LOGGING` (console) + `EXCEPTION_HANDLER`: JSON-ошибки, `IntegrityError`→409, `DatabaseError`→503, лог необработанных исключений с контекстом | `test_404_is_json_not_html` |
+| A-7 | `build.sh`-шаг «Суперюзер» ронял прод-сборку (`CommandError: That Email is already taken.`) | Новая идемпотентная команда `ensure_superuser` (поиск `get_by_natural_key` = `iexact`+`strip`; существующий → повышение флагов, пароль **не** трогается без `--update-password`); `build.sh` больше **не** парсит stdout `manage.py shell -c` | `EnsureSuperuserTests` (6 тестов) |
+
+---
+
+## 🚑 Пост-деплой: падение сборки Render
+
+После мержа PR #1 прод-билд упал в самом конце `build.sh`:
+
+```
+>>> Суперюзер
+CommandError: Error: That Email is already taken.
+==> Build failed
+```
+
+Всё остальное отработало нормально (Python 3.14, `Django==6.1`, `check` → no issues,
+`collectstatic` → «157 copied, 453 post-processed», миграции применились, `seed` пропущен).
+
+### Корень проблемы (воспроизводится 1-в-1)
+
+В `build.sh` был guard:
+
+```bash
+EXISTS=$(python manage.py shell -c "…print(User.objects.filter(email=email).exists())")
+if [ "$EXISTS" = "True" ]; then … else python manage.py createsuperuser --noinput; fi
+```
+
+1. `manage.py shell -c` пишет в stdout **и свою служебную строку**
+   (`11 objects imported automatically (use -v 2 for details).` + пустая строка + `True`),
+   поэтому `[ "$EXISTS" = "True" ]` не истинно никогда → каждый деплой шёл в `else`.
+2. `createsuperuser --noinput` внутри `_validate_username()` бросает
+   `CommandError("That Email is already taken")`, а `set -o errexit` роняет весь билд.
+3. Вторичная хрупкость: guard сравнивал email точно, а `createsuperuser` — через
+   `get_by_natural_key()`, у нас регистронезависимый (`iexact`), т.е. на «наследном»
+   `Admin@Example.com` guard тоже промахивается.
+
+### Решение
+
+Новая management-команда `apps/users/management/commands/ensure_superuser.py`
+(идемпотентная замена `createsuperuser --noinput`):
+
+* опции `--email --password --first-name --last-name --update-password`, каждая падает
+  на env `DJANGO_SUPERUSER_EMAIL / _PASSWORD / _FIRST_NAME / _LAST_NAME / _UPDATE_PASSWORD`;
+* `DJANGO_SUPERUSER_EMAIL` пуст → warning и выход с кодом 0 (в деплое это штатно);
+* поиск — `User._default_manager.get_by_natural_key(email)` (`iexact` + `strip`, как логин),
+  НЕ точное сравнение;
+* не найден → `User.objects.create_superuser(...)`; без пароля → `CommandError`;
+* найден → ничего не создаём: поднять `is_staff`/`is_superuser`, нормализовать `email`
+  к `strip().lower()` (только если нет другой строки с нормализованным email),
+  `first/last_name` — если переданы и отличаются; выход всегда код 0;
+* **пароль существующего пользователя НЕ трогаем** без `--update-password`
+  (иначе каждый деплой возвращает значение из env и отменяет смену пароля в админке);
+* `MultipleObjectsReturned` → `CommandError` с объяснением «разберитесь вручную»,
+  а не молчаливый выбор пользователя;
+* вся логика в `transaction.atomic()`, вывод через `self.style.SUCCESS/WARNING`.
+
+`build.sh` теперь вызывает `python manage.py ensure_superuser` (с `--update-password`,
+если `DJANGO_SUPERUSER_UPDATE_PASSWORD=True`) и больше нигде не парсит вывод `manage.py shell -c`.
+
+Живая симуляция шага «Суперюзер» на чистой sqlite-БД (6 состояний, все rc 0, кроме контраста):
+
+| Состояние | Результат | rc |
+|---|---|---|
+| БД пуста | «Суперюзер создан» | 0 |
+| Повторный запуск | «Суперюзер уже в порядке», пароль из env **не** применён (`check_password` старого пароля = True) | 0 |
+| В env другой пароль | пароль **не** изменён без `--update-password` | 0 |
+| Обычный (не-супер) юзер | «обновлено — is_staff, is_superuser» (+ нормализация email), строк не прибавилось | 0 |
+| `DJANGO_SUPERUSER_EMAIL` не задан | пропуск («не задан — суперюзер не создаётся») | 0 |
+| Контраст: старая схема `createsuperuser --noinput` | `CommandError: That Email is already taken.` | 1 |
 
 ### Не вошло (осознанные follow-up’ы)
 

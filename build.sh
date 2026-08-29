@@ -52,21 +52,23 @@ else
 fi
 
 # --- 5. Суперюзер -----------------------------------------------------------------
-# Теперь можно штатным createsuperuser: у User появился менеджер с create_superuser(email, …)
-# (раньше он падал, поэтому юзера создавали руками через shell -c).
-if [ -n "${DJANGO_SUPERUSER_EMAIL:-}" ] && [ -n "${DJANGO_SUPERUSER_PASSWORD:-}" ]; then
-  echo ">>> Суперюзер"
-  EXISTS=$(python manage.py shell -c "
-import os
-from django.contrib.auth import get_user_model
-email = os.environ['DJANGO_SUPERUSER_EMAIL'].strip().lower()
-print(get_user_model().objects.filter(email=email).exists())
-")
-  if [ "$EXISTS" = "True" ]; then
-    echo "Суперюзер уже существует: $DJANGO_SUPERUSER_EMAIL"
-  else
-    python manage.py createsuperuser --noinput
-  fi
-fi
+# Идемпотентная команда ensure_superuser. Заменяет createsuperuser --noinput, который
+# в этом проекте ронял сборку:
+#   - `manage.py shell -c` пишет в stdout служебную строку (banner) + пустую строку + `True`,
+#     поэтому `[ "$EXISTS" = "True" ]` никогда не истинно и деплой уходил в else;
+#   - `createsuperuser --noinput` бросал `CommandError("That Email is already taken.")`,
+#     а `set -o errexit` валил весь билд.
+# Команда ищет пользователя как логин (iexact + strip), при повторном деплое просто
+# повышает флаги и НЕ трогает пароль существующего пользователя (иначе каждый деплой
+# отменял бы смену пароля в админке). Пароль обновляется только с --update-password
+# (или DJANGO_SUPERUSER_UPDATE_PASSWORD=True).
+echo ">>> Суперюзер"
+SUPERUSER_ARGS=()
+if [ -n "${DJANGO_SUPERUSER_EMAIL:-}" ]; then SUPERUSER_ARGS+=(--email "$DJANGO_SUPERUSER_EMAIL"); fi
+if [ -n "${DJANGO_SUPERUSER_PASSWORD:-}" ]; then SUPERUSER_ARGS+=(--password "$DJANGO_SUPERUSER_PASSWORD"); fi
+if [ -n "${DJANGO_SUPERUSER_FIRST_NAME:-}" ]; then SUPERUSER_ARGS+=(--first-name "$DJANGO_SUPERUSER_FIRST_NAME"); fi
+if [ -n "${DJANGO_SUPERUSER_LAST_NAME:-}" ]; then SUPERUSER_ARGS+=(--last-name "$DJANGO_SUPERUSER_LAST_NAME"); fi
+if [ "${DJANGO_SUPERUSER_UPDATE_PASSWORD:-}" = "True" ]; then SUPERUSER_ARGS+=(--update-password); fi
+python manage.py ensure_superuser "${SUPERUSER_ARGS[@]}"
 
 echo ">>> Сборка завершена успешно"

@@ -658,6 +658,8 @@ Accept: application/json
 | `EMAIL_BACKEND` | `console` при `DEBUG=True`, `smtp` иначе | почта в консоли локально, SMTP на проде |
 | `EMAIL_HOST` / `EMAIL_PORT` / `EMAIL_HOST_USER` / `EMAIL_HOST_PASSWORD` / `EMAIL_USE_TLS` / `EMAIL_TIMEOUT` | `smtp.gmail.com`/`587`/—/—/`True`/`10` | SMTP-подключение; `EMAIL_HOST_USER` заодно подставляется в `DEFAULT_FROM_EMAIL` |
 | `DEFAULT_FROM_EMAIL` | `uzum@localhost` | — |
+| `DJANGO_SUPERUSER_EMAIL` / `_PASSWORD` / `_FIRST_NAME` / `_LAST_NAME` | `admin@example.com` / `your-superuser-password` / `Admin` / `—` | Суперюзер для админки: `build.sh` вызывает `python manage.py ensure_superuser`. Поиск — как логин (`iexact` + `strip`), поэтому регистр email не важен |
+| `DJANGO_SUPERUSER_UPDATE_PASSWORD` | `False` | `True` → применять `DJANGO_SUPERUSER_PASSWORD` и к уже существующему суперюзеру. Без него пароль существующего пользователя **не** трогается (иначе каждый деплой отменял бы смену пароля в админке) |
 | `DJANGO_SETTINGS_MODULE` | `config.settings` | в тестах — `config.test_settings` |
 
 > **Не читается:** `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` (исторические ключи —
@@ -673,7 +675,7 @@ pip install -r requirements/requirements.txt
 
 python manage.py migrate             # без DATABASE_URL в DEBUG поднимется локальный db.sqlite3
 python manage.py seed --force        # демо-данные (по умолчанию seed ничего не трогает)
-python manage.py createsuperuser     # админка: /admin/
+python manage.py ensure_superuser    # админка: /admin/ (идемпотентно, читает DJANGO_SUPERUSER_*)
 python manage.py runserver
 ```
 
