@@ -4,10 +4,13 @@
 больше не вернётся незаметно.
 """
 
+import io
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
-from django.test import override_settings
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
@@ -260,3 +263,76 @@ class MeViewTests(APITestCase):
         self.assertEqual(
             self.client.get("/api/auth/me/", headers={"authorization": f"Bearer {access}"}).status_code, 401
         )
+
+
+class EnsureSuperuserTests(TestCase):
+    """Идемпотентное создание/повышение суперюзера (build.sh, шаг «Суперюзер»).
+
+    Закрывает падение деплоя `CommandError: That Email is already taken.`:
+    раньше build.sh парсил stdout `manage.py shell -c` (где баннер засорял вывод),
+    поэтому guard никогда не срабатывал и деплой уходил в `createsuperuser --noinput`,
+    который бросал CommandError на уже существующем email.
+    """
+
+    def _call(self, **opts):
+        out = io.StringIO()
+        call_command("ensure_superuser", stdout=out, **opts)
+        return out.getvalue()
+
+    def setUp(self):
+        User.objects.all().delete()
+
+    def test_creates_superuser_when_absent(self):
+        self._call(email="boss@example.com", password=PASSWORD, first_name="Bob")
+        user = User.objects.get(email="boss@example.com")
+        self.assertTrue(user.is_staff)
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.check_password(PASSWORD))
+        self.assertEqual(user.first_name, "Bob")
+
+    def test_repeated_run_is_noop_and_keeps_password(self):
+        self._call(email="boss@example.com", password=PASSWORD)
+        user = User.objects.get(email="boss@example.com")
+        before = user.password
+        out = self._call(email="boss@example.com", password="another-new-password-123")
+        self.assertEqual(User.objects.count(), 1)
+        user.refresh_from_db()
+        self.assertEqual(user.password, before)  # пароль без --update-password не трогаем
+        self.assertIn("уже в порядке", out)
+
+    def test_legacy_mixed_case_email_is_promoted_and_normalized(self):
+        # «Наследный» профиль с email в смешанном регистре (записан до нормализации).
+        user = User.objects.create_user(email="admin@example.com", password=PASSWORD)
+        User.objects.filter(pk=user.pk).update(email="Admin@Example.com")
+        count_before = User.objects.count()
+
+        out = self._call(email="Admin@Example.com", password=PASSWORD)
+        User.objects.get(email="admin@example.com")  # нормализован, не дубль
+        self.assertEqual(User.objects.count(), count_before)
+        refreshed = User.objects.get(pk=user.pk)
+        self.assertTrue(refreshed.is_staff)
+        self.assertTrue(refreshed.is_superuser)
+        self.assertEqual(refreshed.email, "admin@example.com")
+        self.assertTrue(refreshed.check_password(PASSWORD))  # хэш не сброшен
+        self.assertIn("обновлён", out)
+
+    def test_update_password_changes_existing_password(self):
+        self._call(email="boss@example.com", password=PASSWORD)
+        user = User.objects.get(email="boss@example.com")
+        self._call(email="boss@example.com", password="brand-new-Pass-42", update_password=True)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("brand-new-Pass-42"))
+        self.assertFalse(user.check_password(PASSWORD))
+
+    def test_empty_email_is_skipped(self):
+        from unittest.mock import patch
+
+        # build.sh полагается на env-путь: DJANGO_SUPERUSER_EMAIL пуст → пропуск, rc 0.
+        with patch.dict("os.environ", {"DJANGO_SUPERUSER_EMAIL": ""}, clear=False):
+            out = self._call()
+        self.assertEqual(User.objects.count(), 0)
+        self.assertIn("не задан", out)
+
+    def test_create_without_password_raises_command_error(self):
+        with self.assertRaises(CommandError):
+            self._call(email="boss@example.com", password="")
