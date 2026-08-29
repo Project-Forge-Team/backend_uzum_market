@@ -317,9 +317,9 @@ JWT_COOKIE = {
     "CSRF_NAME": env("CSRF_COOKIE_NAME", "uzum_csrf"),
 }
 
-# CORS: разрешаем только фронтенд, wildcard "*" при credentials использовать НЕЛЬЗЯ.
+# CORS: разрешаем все домены.
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
 CORS_ALLOWED_ORIGIN_REGEXES = env_list("CORS_ALLOWED_ORIGIN_REGEXES")
 CORS_ALLOW_HEADERS = [
     "accept",
@@ -442,4 +442,4 @@ PAGE_SIZE_MAX = env_int("PAGE_SIZE_MAX", 100)
 # Публичные списки (категории/продавцы) почти не меняются — кэшируем ответ на короткое время.
 CATALOG_CACHE_SECONDS = env_int("CATALOG_CACHE_SECONDS", 60)
 # Локально Django сам отдаёт /media/ (см. config/urls.py); на проде это делает nginx/CDN/S3.
-SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)
+SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)    
