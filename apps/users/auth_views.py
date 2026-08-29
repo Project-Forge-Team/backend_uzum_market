@@ -1,13 +1,14 @@
 """Auth-API: JWT в HttpOnly cookies (+ поддержка Authorization: Bearer).
 
 Один стиль для всех эндпоинтов: токены НЕ возвращаются в теле, они кладутся в cookie.
-Это закрывает и расхождение с документацией (register отдавал токены в теле, но
-пользоваться ими было нельзя), и XSS-вектор с localStorage.
+Это закрывает и расхождение с документацией, и XSS-вектор с localStorage.
 """
 
 import logging
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import ensure_csrf_cookie
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
@@ -16,7 +17,7 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .cookies import clear_auth_cookies, ensure_csrf_cookie, get_refresh_token, set_auth_cookies, tokens_for_user
+from .cookies import clear_auth_cookies, get_refresh_token, set_auth_cookies, tokens_for_user
 from .permissions import CrossSiteCsrfProtect
 from .serializers import EmailTokenObtainPairSerializer, RegisterSerializer, UserSerializer
 from .throttling import ProxyAwareScopedRateThrottle
@@ -25,16 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 class AuthAPIView(APIView):
-    """Общее для всех auth-эндпоинтов: CSRF-защита cookie-флоу + троттлинг.
-
-    Минимальная обвязка сериализатора (у чистого APIView её нет), чтобы не тянуть
-    ради этого GenericAPIView.
-    """
+    """Общее для всех auth-эндпоинтов: CSRF-защита cookie-флоу + троттлинг."""
 
     serializer_class = None
     permission_classes = [CrossSiteCsrfProtect]
-    # Аутентификаторы не отключаем: DRF без них превращает AuthenticationFailed
-    # в 403 вместо 401 (нет WWW-Authenticate) — ломается контракт логина.
     throttle_classes = [ProxyAwareScopedRateThrottle]
 
     def get_serializer_context(self):
@@ -102,11 +97,7 @@ class LoginView(AuthAPIView):
 
 @extend_schema(tags=["auth"])
 class RefreshView(AuthAPIView):
-    """POST /api/auth/refresh/ — новый access (и, при ротации, новый refresh) из cookie.
-
-    Тело не нужно: refresh читается из cookie. При любой ошибке отзываем обе cookie,
-    чтобы фронт однозначно понял «нужен логин».
-    """
+    """POST /api/auth/refresh/ — новый access (и, при ротации, новый refresh) из cookie."""
 
     serializer_class = TokenRefreshSerializer
     permission_classes = [permissions.AllowAny, CrossSiteCsrfProtect]
@@ -121,8 +112,6 @@ class RefreshView(AuthAPIView):
                 Response({"detail": "Refresh token not found in cookies."}, status=status.HTTP_401_UNAUTHORIZED)
             )
 
-        # Не мутируем request.data: для form-encoded/multipart это неизменяемый QueryDict
-        # и эндпоинт падал с 500 (AttributeError: This QueryDict instance is immutable).
         serializer = self.serializer_class(data={"refresh": refresh_token}, context={"request": request})
         try:
             serializer.is_valid(raise_exception=True)
@@ -136,17 +125,13 @@ class RefreshView(AuthAPIView):
             request,
             response,
             access=serializer.validated_data.get("access"),
-            refresh=serializer.validated_data.get("refresh"),  # есть только при ROTATE_REFRESH_TOKENS=True
+            refresh=serializer.validated_data.get("refresh"),
         )
 
 
 @extend_schema(tags=["auth"])
 class LogoutView(AuthAPIView):
-    """POST /api/auth/logout/ — отзыв refresh-токена (блэклист) + чистка cookies.
-
-    Доступен и анонимно: раньше он требовал авторизации, и пользователь с истёкшим
-    access-токеном не мог разлогиниться (401 вместо чистки cookie).
-    """
+    """POST /api/auth/logout/ — отзыв refresh-токена (блэклист) + чистка cookies."""
 
     permission_classes = [permissions.AllowAny, CrossSiteCsrfProtect]
 
@@ -155,13 +140,10 @@ class LogoutView(AuthAPIView):
         raw = get_refresh_token(request)
         if raw:
             try:
-                # Штатный отзыв SimpleJWT: OutstandingToken создаётся сигналом jwt_signed,
-                # вручную его не нужно заполнять (а попытки это делали ломали logout молча).
                 RefreshToken(raw).blacklist()
             except TokenError:
-                pass  # уже отозван/истёк/blacklist-приложение выключено — штатно
+                pass  # уже отозван/истёк/blacklist-приложение выключено
             except Exception:
-                # Раньше здесь был «except Exception: pass», и сломанный logout не было видно.
                 logger.exception("Не удалось добавить refresh-токен в блэклист")
 
         response = Response({"detail": "Successfully logged out."}, status=status.HTTP_200_OK)
@@ -169,18 +151,17 @@ class LogoutView(AuthAPIView):
 
 
 @extend_schema(tags=["auth"])
-class CsrfView(AuthAPIView):
-    """GET /api/auth/csrf/ — бустрап double-submit CSRF-токена.
-
-    Нужен, когда cookie живут в SameSite=None (фронт на другом домене): unsafe-запросы
-    обязаны нести заголовок X-CSRFToken с этим значением.
-    """
+@method_decorator(ensure_csrf_cookie, name='dispatch') # 🔥 ГАРАНТИРОВАННО заставляет Django отправить Set-Cookie
+class CsrfView(APIView):
+    """GET /api/auth/csrf/ — бустрап double-submit CSRF-токена."""
 
     permission_classes = [permissions.AllowAny]
+    authentication_classes = [] # 🔥 Явно отключаем, аутентификация здесь не нужна
 
     @extend_schema(responses={200: None})
     def get(self, request, *args, **kwargs):
-        return ensure_csrf_cookie(request, Response({"detail": "ok"}, status=status.HTTP_200_OK))
+        # Благодаря декоратору выше, Django сам добавит заголовок Set-Cookie с токеном
+        return Response({"detail": "CSRF cookie set"}, status=status.HTTP_200_OK)
 
 
 @extend_schema(tags=["auth"])

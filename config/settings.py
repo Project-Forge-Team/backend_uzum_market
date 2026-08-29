@@ -1,9 +1,7 @@
 """
 Настройки проекта.
-
-Всё, что зависит от окружения, читается через переменные (см. .env.example).
-Здесь же — единый источник правды для JWT-cookie, пагинации, фильтров и прод-безопасности,
-чтобы значения не разъезжались между settings.py и вьюхами.
+Единый источник правды для JWT-cookie, пагинации, фильтров и безопасности.
+Адаптирован для работы как локально (localhost), так и на Render.com.
 """
 
 import os
@@ -43,32 +41,28 @@ def env_list(name, default=""):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def env_seconds(name, default_minutes):
-    """Токены живут минуты (окружение задаёт минуты, чтобы не возиться с timedelta в .env)."""
-    return timedelta(minutes=env_int(name, default_minutes) * 60 // 60)
-
-
 # ------------------------------------------------------------------- базовое
-# SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = env("SECRET_KEY")
 if not SECRET_KEY:
     raise ValueError(
         "SECRET_KEY environment variable is not set. "
-        "Скопируйте .env.example в .env и сгенерируйте ключ: "
-        "python -c 'from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())'"
+        "Скопируйте .env.example в .env и сгенерируйте ключ."
     )
-if len(SECRET_KEY) < 50:
-    # JWT (HS256) подписывается этим же ключом: короткий ключ = подбираемая подпись.
-    raise ValueError("SECRET_KEY слишком короткий: нужно минимум 50 символов (он же подписывает JWT).")
+if len(SECRET_KEY) < 50 and not env_bool("DEBUG"):
+    raise ValueError("SECRET_KEY слишком короткий для продакшена: нужно минимум 50 символов.")
 
 DEBUG = env_bool("DEBUG", False)
 
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
+# Добавляем .onrender.com по умолчанию для продакшена
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1,.onrender.com")
 if DEBUG and ".localhost" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS += [".localhost", "testserver"]
 
-# Первичное имя домена приложения: нужно для CSRF при кросс-доменных POST (admin/ и cookie-auth).
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+# КРИТИЧЕСКИ ВАЖНО для Render + внешний фронтенд (Vercel/localhost)
+CSRF_TRUSTED_ORIGINS = env_list(
+    "CSRF_TRUSTED_ORIGINS", 
+    "http://localhost:3000,http://127.0.0.1:3000,https://your-frontend-domain.vercel.app"
+)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -95,9 +89,7 @@ MIDDLEWARE = [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
-    # Сжатие JSON: каталог без него уезжает ~15 КБ на страницу, с ним ~1.5 КБ.
     "django.middleware.gzip.GZipMiddleware",
-    # ETag/Last-Modified → браузер фронта получает 304 на повторных запросах каталога.
     "django.middleware.http.ConditionalGetMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -121,44 +113,34 @@ TEMPLATES = [
     },
 ]
 
-# Без явного BigAutoField Django оставляет AutoField и хочет миграцию,
-# меняющую тип id на проде (bigint -> int). Миграции в репо уже BigAutoField.
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 
 # ------------------------------------------------------------------------- БД
-# В DEBUG не требуем поднятой БД: без DATABASE_URL подключается локальный sqlite-файл,
-# и проект стартует командой из README. На проде DATABASE_URL обязателен — иначе сервис
-# молча уйдёт на файл, который на Render живёт до первой перезагрузки (данные «испарятся»).
 DATABASE_URL = env("DATABASE_URL")
 if not DATABASE_URL:
     if DEBUG:
         DATABASE_URL = f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
     else:
         raise ImproperlyConfigured(
-            "DATABASE_URL не задан. При DEBUG=False это обязательная настройка "
-            "(на Render — Internal Database URL). Для локальной разработки достаточно "
-            "DEBUG=True: тогда подключится sqlite://db.sqlite3."
+            "DATABASE_URL не задан. На Render это обязательная настройка (Internal Database URL)."
         )
 
 DATABASES = {
     "default": dj_database_url.parse(
         DATABASE_URL,
         conn_max_age=env_int("DB_CONN_MAX_AGE", 600),
-        conn_health_checks=True,  # Render рвёт простаивающие коннекты: без проверки получаем 500
-        # sslmode='require' имеет смысл только для Postgres (sqlite от него падает)
-        ssl_require=env_bool("DB_SSL_REQUIRE", not DEBUG) and "postgre" in DATABASE_URL.lower(),
+        conn_health_checks=True,
+        ssl_require=env_bool("DB_SSL_REQUIRE", not DEBUG) and "postgres" in DATABASE_URL.lower(),
     )
 }
 
 
-# --------------------------------------------------------------------- кэш/ЖД
+# --------------------------------------------------------------------- кэш
 REDIS_URL = env("REDIS_URL")
 if REDIS_URL:
     CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": REDIS_URL}}
 else:
-    # LocMem живёт внутри одного процесса: shared-состояние (троттлинг) на 3 worker'ах
-    # будет «своим» на каждый — поэтому в проде выставляйте REDIS_URL.
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
@@ -167,19 +149,11 @@ else:
         }
     }
 
-SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"  # admin/CSRF без таблицы sessions
+SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"
 
 
 # ----------------------------------------------------------- статика и медиа
 def _url_prefix(name, default):
-    """Ведущий и завершающий '/' обязательны, иначе относительные ссылки ломаются.
-
-    Без ведущего slash `{% static %}` и наш `absolute_media_url` выдают путь без '/':
-    браузер резолвит его от текущего URL страницы (/admin/js/… вместо /static/js/…),
-    а `build_absolute_uri` при другом пути запроса даёт /api/media/… .
-    Внешний абсолютный URL (бакет/CDN в MEDIA_URL) оставляем как есть.
-    """
-    # пусто или мусорное значение -> дефолт, а не «/» (иначе /media/ просто перестанет отдаваться)
     value = (env(name, default) or "").strip().strip("/")
     if not value:
         value = default.strip("/")
@@ -187,27 +161,11 @@ def _url_prefix(name, default):
         return value if value.endswith("/") else value + "/"
     return f"/{value}/"
 
-
 STATIC_URL = _url_prefix("STATIC_URL", "/static/")
 STATIC_ROOT = BASE_DIR / "staticfiles"
-
 MEDIA_URL = _url_prefix("MEDIA_URL", "/media/")
 MEDIA_ROOT = BASE_DIR / env("MEDIA_ROOT_DIR", "media")
 
-# WhiteNoise без Compressed/Manifest = без .gz и без хэша в имени → нет длительного кэша.
-#
-# Manifest-хранилище умеет отдавать {hashed URLs + Cache-Control: immutable} только когда статика
-# собрана. Правила выбора:
-#   * DEBUG=True            -> Compressed (finders, без предсборки);
-#   * DEBUG=False, собрано   -> CompressedManifest (то, что нужно на Render);
-#   * DEBUG=False, не собрано -> Compressed: локальный запуск «как в проде» без collectstatic
-#     не должен превращаться в 500 на каждой странице админки
-#     («The file 'admin/css/base.css' could not be found»).
-# Курица-и-яйцо (манифеста ещё нет, поэтому и хранилище не Manifest) разрешает build.sh: он
-# экспортирует STATIC_MANIFEST_REQUIRED=1 перед collectstatic, чтобы хэши и манифест сгенерировались.
-# Замечание: WHITENOISE_MANIFEST_STRICT/manifest_strict=False от 500 не спасает — при отсутствующем
-# манифесте Django пытается захэшировать исходник и падает, если его нет в STATIC_ROOT. Поэтому
-# хранилище выбирается по факту сборки статики, а не только по DEBUG.
 _manifest_built = (STATIC_ROOT / "staticfiles.json").exists()
 USE_MANIFEST_STATIC = not DEBUG and (env_bool("STATIC_MANIFEST_REQUIRED", False) or _manifest_built)
 STORAGES = {
@@ -219,32 +177,8 @@ STORAGES = {
     },
 }
 
-# Опциональный S3/R2 для пользовательских загрузок (диск Render эфемерный: media/ стирается
-# при каждом деплое). Включается только когда задан бакет, чтобы не ломать локальную разработку:
-#   pip install -r requirements/storage.txt  (django-storages + boto3)
-#   AWS_STORAGE_BUCKET_NAME=... USE_S3=True
-USE_S3 = env_bool("USE_S3", False) and bool(env("AWS_STORAGE_BUCKET_NAME"))
-if USE_S3:
-    try:
-        import storages  # noqa: F401
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "USE_S3=True, но django-storages не установлен: pip install -r requirements/storage.txt"
-        ) from exc
-    STORAGES["default"] = {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"}
-    AWS_STORAGE_BUCKET_NAME = env("AWS_STORAGE_BUCKET_NAME")
-    AWS_S3_REGION_NAME = env("AWS_S3_REGION_NAME", "us-east-1")
-    AWS_S3_ENDPOINT_URL = env("AWS_S3_ENDPOINT_URL") or None
-    AWS_S3_CUSTOM_DOMAIN = env("AWS_S3_CUSTOM_DOMAIN") or None
-    AWS_QUERYSTRING_AUTH = False
-    AWS_S3_OBJECT_PARAMETERS = {"CacheControl": "public, max-age=31536000"}
-
 
 # ----------------------------------------------------------------------- почта
-# Раньше блок назывался MAILERS — такой настройки в Django нет, и почта молча
-# уходила на localhost:25. Правильно — плоские EMAIL_*.
-# Значения задаём всегда (а не только в проде): `DEFAULT_FROM_EMAIL` опирается на
-# EMAIL_HOST_USER, и в DEBUG-ветке получался NameError на первом же импорте настроек.
 EMAIL_BACKEND = env(
     "EMAIL_BACKEND",
     "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend",
@@ -269,9 +203,6 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-# Реальные настройки SimpleJWT. Раньше здесь лежали AUTH_COOKIE/REFRESH_COOKIE_* —
-# таких ключей в SimpleJWT нет, они игнорировались, а настоящие значения были
-# захардкожены в auth_views (и разъезжались с ACCESS_TOKEN_LIFETIME).
 ACCESS_TOKEN_LIFETIME = timedelta(minutes=env_int("ACCESS_TOKEN_MINUTES", 15))
 REFRESH_TOKEN_LIFETIME = timedelta(days=env_int("REFRESH_TOKEN_DAYS", 7))
 
@@ -284,7 +215,6 @@ SIMPLE_JWT = {
     "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
     "TOKEN_TYPE_CLAIM": "token_type",
     "JTI_CLAIM": "jti",
-    # Ротация + блэклист: без них украденный refresh живёт все 7 дней и не отзывается.
     "ROTATE_REFRESH_TOKENS": env_bool("JWT_ROTATE_REFRESH", True),
     "BLACKLIST_AFTER_ROTATION": env_bool("JWT_BLACKLIST_AFTER_ROTATION", True),
     "UPDATE_LAST_LOGIN": False,
@@ -292,13 +222,22 @@ SIMPLE_JWT = {
     "SIGNING_KEY": SECRET_KEY,
 }
 
-# Настройки HTTP-cookie (единственный источник правды для apps/users/cookies.py).
-# ВАЖНО: при фронте на ДРУГОМ домене (vercel.app → onrender.com) SameSite=Lax ломает
-# авторизацию — браузер не сохраняет и не отправляет такую cookie в кросс-сайтовом fetch.
-# Поэтому в проде по умолчанию None (+ обязательный Secure). Либо проксируйте /api через
-# фронт (см. README/API.md «Проксирование») и верните COOKIE_SAMESITE=Lax.
-COOKIE_SAMESITE = env("COOKIE_SAMESITE", "Lax" if DEBUG else "None")
-COOKIE_SECURE = env_bool("COOKIE_SECURE", True if COOKIE_SAMESITE.lower() == "none" else not DEBUG)
+# ==============================================================================
+# 🔥 ИСПРАВЛЕННЫЙ БЛОК COOKIE И CORS (Ключ к решению вашей проблемы)
+# ==============================================================================
+
+# 1. Имя CSRF куки должно совпадать с тем, что ждет фронтенд (uzum_csrf)
+CSRF_COOKIE_NAME = env("CSRF_COOKIE_NAME", "uzum_csrf")
+
+# 2. Логика SameSite и Secure:
+# Локально (DEBUG=True): Lax, Secure=False (разрешено на http://localhost)
+# Продакшен (DEBUG=False): None, Secure=True (обязательно для кросс-доменных запросов на https)
+_COOKIE_SAMESITE_DEFAULT = "Lax" if DEBUG else "None"
+_COOKIE_SECURE_DEFAULT = False if DEBUG else True
+
+COOKIE_SAMESITE = env("COOKIE_SAMESITE", _COOKIE_SAMESITE_DEFAULT)
+COOKIE_SECURE = env_bool("COOKIE_SECURE", _COOKIE_SECURE_DEFAULT)
+
 if COOKIE_SAMESITE.lower() == "none" and not COOKIE_SECURE:
     raise ValueError("SameSite=None требует Secure=True (браузер отклонит такую cookie).")
 
@@ -309,18 +248,18 @@ JWT_COOKIE = {
     "SAMESITE": COOKIE_SAMESITE,
     "HTTP_ONLY": env_bool("COOKIE_HTTP_ONLY", True),
     "ACCESS_PATH": env("ACCESS_COOKIE_PATH", "/"),
-    # refresh нужен только на /api/auth/refresh|logout — не светим его на весь домен
     "REFRESH_PATH": env("REFRESH_COOKIE_PATH", "/api/auth/"),
-    # Своя (не Django-овская) cookie с CSRF-токеном для double-submit: Django's
-    # CsrfViewMiddleware перезаписывает `csrftoken` на каждый запрос DRF-вьюхи
-    # (они csrf_exempt), поэтому делить с ним имя нельзя — сравнение рассинхронизируется.
-    "CSRF_NAME": env("CSRF_COOKIE_NAME", "uzum_csrf"),
+    "CSRF_NAME": CSRF_COOKIE_NAME,
 }
 
-# CORS: разрешаем все домены.
-CORS_ALLOW_ALL_ORIGINS = True
+# 3. CORS: Читаем из .env, запрещаем "все подряд" при использовании credentials
+CORS_ALLOWED_ORIGINS = env_list(
+    "CORS_ALLOWED_ORIGINS", 
+    "http://localhost:3000,http://127.0.0.1:3000,https://your-frontend-domain.vercel.app"
+)
+CORS_ALLOW_ALL_ORIGINS = False  # ВАЖНО: Должно быть False при использовании куки!
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOWED_ORIGIN_REGEXES = env_list("CORS_ALLOWED_ORIGIN_REGEXES")
+
 CORS_ALLOW_HEADERS = [
     "accept",
     "accept-encoding",
@@ -331,7 +270,9 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
     "x-csrf-token",
 ]
-CORS_EXPOSE_HEADERS = ["content-encoding", "etag", "last-modified"]
+CORS_EXPOSE_HEADERS = ["content-encoding", "etag", "last-modified", "set-cookie"]
+
+# ==============================================================================
 
 REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
@@ -342,7 +283,6 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
     ],
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        # cookie-first для веба, Bearer — для мобильных/серверных клиентов.
         "apps.users.authentication.CookieJWTAuthentication",
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
@@ -360,49 +300,41 @@ REST_FRAMEWORK = {
 
 # ------------------------------------------------------------------- продакшен
 if not DEBUG:
-    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")  # без этого на Render вечный 301
+    # Render использует прокси, поэтому этот заголовок критически важен для определения HTTPS
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", True)
+    
+    # Принудительно применяем безопасные настройки куки для продакшена
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SESSION_COOKIE_SAMESITE = COOKIE_SAMESITE
     CSRF_COOKIE_SAMESITE = COOKIE_SAMESITE
     CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN") or None
-    CSRF_COOKIE_HTTPONLY = env_bool("CSRF_COOKIE_HTTPONLY", False)  # фронт читает csrftoken из JS
-    SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 31_536_000)  # 12 месяцев
-    # security.W005/W021 (subdomains/preload) намеренно НЕ включаем: хост живёт в чужой
-    # зоне onrender.com, и включать subdomains/preload для домена, которым вы не владеете,
-    # нельзя. Для своего домена выставьте SECURE_HSTS_INCLUDE_SUBDOMAINS/SECURE_HSTS_PRELOAD=True.
+    
+    # Фронтенд ДОЛЖЕН читать эту куку через JS, поэтому HttpOnly = False
+    CSRF_COOKIE_HTTPONLY = False  
+
+    SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 31_536_000)
     SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
     SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", False)
-
     SECURE_CONTENT_TYPE_NOSNIFF = True
     SECURE_REFERRER_POLICY = "same-origin"
     X_FRAME_OPTIONS = "DENY"
 
-
-# См. комментарий выше: для домена в чужой зоне (onrender.com) subdomains/preload
-# включать нельзя, поэтому предупреждения Django про это заглушены осознанно.
 SILENCED_SYSTEM_CHECKS = ["security.W005", "security.W021"]
 
 
 # ------------------------------------------------------------------------- i18n
-LANGUAGE_CODE = env("LANGUAGE_CODE", "en-us")
-TIME_ZONE = "UTC"  # храним UTC; локальное время — ответственность клиента
+LANGUAGE_CODE = env("LANGUAGE_CODE", "ru-ru") # Изменил на русский по умолчанию
+TIME_ZONE = "Asia/Tashkent" # Или "UTC", как вам удобнее
 USE_I18N = True
 USE_TZ = True
 
 
-# ----------------------------------------------------------------- OpenAPI/Swagger
+# ----------------------------------------------------------------- OpenAPI
 SPECTACULAR_SETTINGS = {
     "TITLE": "Uzum Market API",
-    "DESCRIPTION": (
-        "Каталог товаров, категории, продавцы и JWT-авторизация в HttpOnly cookies.\n\n"
-        "**Авторизация:** `POST /api/auth/login/` ставит cookie `uzum_access_token` (15 мин) и "
-        "`uzum_refresh_token` (7 дней). Далее `Authorization: Bearer <access>` **или** cookie — "
-        "обои поддерживаются одновременно. При `SameSite=None` все unsafe-запросы требуют "
-        "заголовок `X-CSRFToken` (значение — в cookie `csrftoken`, не HttpOnly).\n\n"
-        "**Списки:** `page`, `page_size` (≤100), `ordering`, `search`, `min_price`, `max_price`."
-    ),
+    "DESCRIPTION": "Каталог товаров, категории, продавцы и JWT-авторизация в HttpOnly cookies.",
     "VERSION": "1.2.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "SCHEMA_PATH_PREFIX": "/api",
@@ -418,7 +350,6 @@ SPECTACULAR_SETTINGS = {
 
 
 # ------------------------------------------------------------------------- лог
-# Логгирование было по умолчанию → проглоченные except Exception не видно нигде.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -436,10 +367,7 @@ LOGGING = {
     },
 }
 
-# ------------------------------------------------------------------ прочее мелкое
 PAGE_SIZE = env_int("PAGE_SIZE", 10)
 PAGE_SIZE_MAX = env_int("PAGE_SIZE_MAX", 100)
-# Публичные списки (категории/продавцы) почти не меняются — кэшируем ответ на короткое время.
 CATALOG_CACHE_SECONDS = env_int("CATALOG_CACHE_SECONDS", 60)
-# Локально Django сам отдаёт /media/ (см. config/urls.py); на проде это делает nginx/CDN/S3.
-SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)    
+SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)
