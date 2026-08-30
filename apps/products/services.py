@@ -104,5 +104,7 @@ def active_seller_product_counts() -> dict[int, int]:
 def owns_product(user, product) -> bool:
     if user is None or not getattr(user, "is_authenticated", False):
         return False
+    if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+        return True
     shop = getattr(user, "shop", None)
     return product.seller_id is not None and shop is not None and shop.pk == product.seller_id
