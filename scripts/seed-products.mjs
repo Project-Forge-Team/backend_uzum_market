@@ -1,139 +1,220 @@
 /**
- * Сид: удаляет все текущие товары и создаёт ~50 новых с реальными фотографиями.
+ * Сид витрины на ЖИВОМ бэкенде (прод или любой другой по BACKEND_URL).
+ *
+ * Что делает:
+ *   1. Читает с сервера категории и магазины.
+ *   2. Логинится демо-аккаунтами владельцев магазинов (пароль Password123).
+ *   3. Удаляет ВСЕ существующие товары — активные, черновики и архив
+ *      (каждый товар удаляется от лица своего магазина: API разрешает
+ *      удаление только владельцу).
+ *   4. Публикует товары из PRODUCTS ниже — каждый в «своём» магазине
+ *      (seller_id в данных = порядковый номер магазина сида).
+ *   5. Проверяет результат: сколько товаров видно в витрине.
  *
  * Использование:
- *   node scripts/seed-products.mjs
+ *   node scripts/seed-products.mjs                    # прод (backend-uzum-market.onrender.com)
+ *   BACKEND_URL=http://127.0.0.1:8000 node scripts/seed-products.mjs
+ *   node scripts/seed-products.mjs --dry-run          # ничего не менять, только показать план
  *
- * Работает через Django-API бэкенда (BACKEND_URL или прод).
- * Аутентифицируется через демо-аккаунты, потому что создание/удаление
- * товаров требует сессию продавца.
+ * Внешних зависимостей нет — только встроенный fetch (Node >= 18).
+ * Лимиты API: логин — 10/мин на IP (поэтому между входами пауза),
+ * запись товаров — 60/час на пользователя (пишем от разных магазинов).
  */
 
-const BACKEND = (
-  process.env.BACKEND_URL ?? "https://backend-uzum-market.onrender.com"
-)
+const BACKEND = (process.env.BACKEND_URL ?? "https://backend-uzum-market.onrender.com")
   .replace(/\/+$/, "")
   .replace(/\/api$/, "");
 const API = `${BACKEND}/api`;
 
-// ── Sellers & auth ─────────────────────────────────────────────
+const DRY_RUN = process.argv.includes("--dry-run");
+const DEMO_PASSWORD = process.env.DEMO_PASSWORD ?? "Password123";
+const WRITE_PAUSE_MS = Number(process.env.WRITE_PAUSE_MS ?? 700);
+const LOGIN_PAUSE_MS = Number(process.env.LOGIN_PAUSE_MS ?? 7000);
 
-const SELLER_ACCOUNTS = [
-  { email: "seller@uzum.uz", password: "Password123" }, // Uzum Students (id=1)
-  { email: "electro@uzum.uz", password: "Password123" }, // Electro House (id=2)
-];
+// slug магазина → демо-аккаунт владельца (см. DEMO_USERS в apps/products/dataset.py)
+const SELLER_ACCOUNTS = {
+  "uzum-students": "seller@uzum.uz",
+  "electro-house": "electro@uzum.uz",
+  "techno-plus": "techno@uzum.uz",
+  "smart-house": "smart@uzum.uz",
+  "gadget-zone": "gadget@uzum.uz",
+  "home-and-garden": "home@uzum.uz",
+  "sport-line": "sport@uzum.uz",
+  "book-world": "book@uzum.uz",
+  "beauty-uz": "beauty@uzum.uz",
+  "kids-planet": "kids@uzum.uz",
+};
 
-// We'll map seller slugs → session cookies
-// const sessions = {};
+// seller_id из PRODUCTS → slug магазина: порядок SELLERS в apps/products/dataset.py
+const SELLER_SLUG_BY_ID = {
+  1: "uzum-students",
+  2: "electro-house",
+  3: "techno-plus",
+  4: "smart-house",
+  5: "gadget-zone",
+  6: "home-and-garden",
+  7: "sport-line",
+  8: "book-world",
+  9: "beauty-uz",
+  10: "kids-planet",
+};
 
-async function login(email, password) {
-  // First, get CSRF
-  const csrfRes = await fetch(`${API}/auth/csrf/`, { credentials: "include" });
-  const csrfCookies = csrfRes.headers.getSetCookie?.() ?? [];
-  let csrfToken = "";
-  let allCookies = [];
+// category_id из PRODUCTS → slug категории: порядок CATEGORIES в apps/products/dataset.py
+const CATEGORY_SLUG_BY_ID = {
+  1: "elektronika",
+  2: "bytovaya-tehnika",
+  3: "odezhda",
+  4: "obuv",
+  5: "krasota",
+  6: "sport",
+  7: "dom-i-sad",
+  8: "knigi",
+  9: "detyam",
+  10: "produkty",
+};
 
-  for (const c of csrfCookies) {
-    allCookies.push(c.split(";")[0]);
-    if (c.startsWith("uzum_csrf=")) {
-      csrfToken = c.split(";")[0].split("=")[1];
-    }
+// ── HTTP ───────────────────────────────────────────────────────
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function collectCookies(res, jar) {
+  const raw = res.headers.getSetCookie?.() ?? [];
+  for (const cookie of raw) {
+    const pair = cookie.split(";")[0];
+    if (!pair || !pair.includes("=")) continue;
+    jar.set(pair.slice(0, pair.indexOf("=")), pair);
   }
+}
 
-  const res = await fetch(`${API}/auth/login/`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRFToken": csrfToken,
-      Cookie: allCookies.join("; "),
-    },
-    body: JSON.stringify({ email, password }),
-  });
+const cookieHeader = (jar) => [...jar.values()].join("; ");
+const csrfFrom = (jar) => (jar.get("uzum_csrf") ?? "").split("=")[1] ?? "";
 
+async function publicGet(path) {
+  const res = await fetch(`${API}${path}`, { headers: { Accept: "application/json" } });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Login failed for ${email}: ${res.status} ${text}`);
+    throw new Error(`GET ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
   }
-
-  const loginCookies = res.headers.getSetCookie?.() ?? [];
-  for (const c of loginCookies) {
-    allCookies.push(c.split(";")[0]);
-    if (c.startsWith("uzum_csrf=")) {
-      csrfToken = c.split(";")[0].split("=")[1];
-    }
-  }
-
-  const user = await res.json();
-  console.log(
-    `  ✓ Logged in as ${user.first_name} (seller_id=${user.seller_id})`,
-  );
-
-  return { cookies: allCookies.join("; "), csrfToken, user };
-}
-
-async function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function apiCall(method, path, body, session) {
-  const headers = {
-    Accept: "application/json",
-    Cookie: session.cookies,
-  };
-  if (body && !(body instanceof FormData)) {
-    headers["Content-Type"] = "application/json";
-  }
-  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
-    headers["X-CSRFToken"] = session.csrfToken;
-  }
-
-  const res = await fetch(`${API}${path}`, {
-    method,
-    headers,
-    body: body
-      ? typeof body === "string"
-        ? body
-        : JSON.stringify(body)
-      : undefined,
-  });
-
-  if (!res.ok && res.status !== 204) {
-    const text = await res.text();
-    console.error(`  ✗ ${method} ${path}: ${res.status} ${text.slice(0, 200)}`);
-    return null;
-  }
-
-  if (res.status === 204) return {};
   return res.json();
 }
 
-// ── Categories (from backend) ──────────────────────────────────
+/**
+ * Запрос от лица сессии. Возвращает распарсенный JSON или null,
+ * если сервер ответил ошибкой (текст ошибки печатается сразу).
+ * 429 и 5xx — повторяем с паузой.
+ */
+async function apiCall(session, method, path, body) {
+  const url = `${API}${path}`;
 
-// Category IDs from the backend:
-// 1: Электроника (elektronika)
-// 2: Бытовая техника (bytovaya-tehnika)
-// 3: Одежда (odezhda)
-// 4: Обувь (obuv)
-// 5: Красота (krasota)
-// 6: Спорт (sport)
-// 7: Дом и сад (dom-i-sad)
-// 8: Книги (knigi)
-// 9: Детям (detyam)
-// 10: Продукты (produkty)
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    let res;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Accept: "application/json",
+          Cookie: cookieHeader(session.jar),
+          ...(body ? { "Content-Type": "application/json" } : {}),
+          ...(["POST", "PUT", "PATCH", "DELETE"].includes(method)
+            ? { "X-CSRFToken": csrfFrom(session.jar) }
+            : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (error) {
+      if (attempt === 4) {
+        console.error(`  ✗ ${method} ${path}: сеть — ${error.message}`);
+        return null;
+      }
+      await sleep(2000 * attempt);
+      continue;
+    }
 
-// Seller IDs:
-// 1: Uzum Students
-// 2: Electro House
-// 3: Techno Plus
-// 4: Smart House
-// 5: Gadget Zone
-// 6: Home & Garden
-// 7: Sport Line
-// 8: Book World
-// 9: Beauty UZ
-// 10: Kids Planet
+    collectCookies(res, session.jar); // сервер может перевыпустить csrf/сессию
 
-// ── Products with real images ──────────────────────────────────
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get("Retry-After") ?? 0);
+      const wait = (retryAfter > 0 ? retryAfter : 60) * 1000;
+      console.warn(`  ⏳ 429 на ${method} ${path} — жду ${Math.round(wait / 1000)} с`);
+      await sleep(wait);
+      attempt -= 1; // ожидание после лимита не считаем попыткой
+      continue;
+    }
+
+    if (res.status >= 500) {
+      if (attempt === 4) {
+        console.error(`  ✗ ${method} ${path}: ${res.status}`);
+        return null;
+      }
+      await sleep(3000 * attempt);
+      continue;
+    }
+
+    if (!res.ok) {
+      const text = (await res.text()).slice(0, 300);
+      console.error(`  ✗ ${method} ${path}: ${res.status} ${text}`);
+      return null;
+    }
+
+    return res.status === 204 ? {} : res.json();
+  }
+
+  return null;
+}
+
+async function login(email, password) {
+  const jar = new Map();
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const csrfRes = await fetch(`${API}/auth/csrf/`, { headers: { Accept: "application/json" } });
+    collectCookies(csrfRes, jar);
+    const csrf = csrfFrom(jar);
+
+    const res = await fetch(`${API}/auth/login/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-CSRFToken": csrf,
+        Cookie: cookieHeader(jar),
+      },
+      body: JSON.stringify({ email, password }),
+    });
+
+    if (res.status === 429) {
+      console.warn(`  ⏳ 429 на логин ${email} — жду 60 с`);
+      await sleep(60_000);
+      continue;
+    }
+
+    if (!res.ok) {
+      throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+    }
+
+    collectCookies(res, jar);
+    const user = await res.json();
+    if (!user?.seller_id) {
+      throw new Error("у аккаунта нет магазина");
+    }
+    return { email, jar, user, sellerId: user.seller_id };
+  }
+
+  throw new Error("429: лимит логинов, попробуйте позже");
+}
+
+const resultsOf = (payload) => payload?.results ?? (Array.isArray(payload) ? payload : []);
+
+async function fetchAll(session, path) {
+  const items = [];
+  for (let page = 1; page <= 20; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const payload = await apiCall(session, "GET", `${path}${separator}page_size=120&page=${page}`);
+    if (!payload) break;
+    const chunk = resultsOf(payload);
+    items.push(...chunk);
+    if (!payload.next || chunk.length === 0) break;
+  }
+  return items;
+}
 
 const PRODUCTS = [
   // ═════════════════════════════════════
@@ -1363,95 +1444,107 @@ const PRODUCTS = [
 // ── Main ───────────────────────────────────────────────────────
 
 async function main() {
-  console.log(`\n🔗 Backend: ${BACKEND}\n`);
+  console.log(`\n🔗 Бэкенд: ${BACKEND}${DRY_RUN ? " (DRY RUN — ничего не меняю)" : ""}\n`);
 
-  // 1. Login as all sellers
-  console.log("📋 Step 1: Authenticating seller accounts...");
-  const sessions = {};
-  for (const account of SELLER_ACCOUNTS) {
+  // ── 1. Категории и магазины ────────────────────────────────
+  console.log("📋 Шаг 1: категории и магазины");
+  const categories = resultsOf(await publicGet("/categories/"));
+  const sellers = resultsOf(await publicGet("/sellers/"));
+  if (categories.length === 0 || sellers.length === 0) {
+    console.error("✗ На сервере нет категорий/магазинов. Сначала выполните сид: python manage.py seed --reset");
+    process.exit(1);
+  }
+  const categoryIdBySlug = new Map(categories.map((c) => [c.slug, c.id]));
+  const categoryIdById = new Map(categories.map((c) => [c.id, c]));
+  const sellerBySlug = new Map(sellers.map((s) => [s.slug, s]));
+  console.log(`  категорий: ${categories.length}, магазинов: ${sellers.length}`);
+
+  const before = await publicGet("/products/?page_size=4");
+  console.log(`  товаров в витрине сейчас: ${before.count}`);
+
+  // ── 2. Логины владельцев магазинов ─────────────────────────
+  console.log("\n📋 Шаг 2: вход в аккаунты магазинов");
+  const sessions = new Map(); // slug → session
+  for (const [slug, email] of Object.entries(SELLER_ACCOUNTS)) {
+    if (!sellerBySlug.has(slug)) {
+      console.warn(`  − магазин ${slug} не найден на сервере — пропускаю`);
+      continue;
+    }
     try {
-      const session = await login(account.email, account.password);
-      sessions[account.email] = session;
-    } catch (e) {
-      console.error(`  ✗ Failed to login ${account.email}: ${e.message}`);
+      const session = await login(email, DEMO_PASSWORD);
+      session.sellerSlug = slug;
+      sessions.set(slug, session);
+      console.log(`  ✓ ${slug} (seller_id=${session.sellerId}, ${email})`);
+    } catch (error) {
+      console.warn(`  ✗ не удалось войти как ${email}: ${error.message}`);
     }
+    await sleep(LOGIN_PAUSE_MS); // лимит /auth/login/ — 10 запросов в минуту на IP
   }
 
-  // Use electro@uzum.uz as primary session (Electro House, seller_id=2)
-  const primarySession =
-    sessions["electro@uzum.uz"] || sessions["seller@uzum.uz"];
-  if (!primarySession) {
-    console.error("✗ No seller sessions available. Cannot proceed.");
+  if (sessions.size === 0) {
+    console.error("\n✗ Ни один аккаунт продавца не доступен — дальше нечего делать.");
     process.exit(1);
   }
+  console.log(`  доступно сессий: ${sessions.size}`);
 
-  // 2. Get all current products
-  console.log("\n📋 Step 2: Fetching existing products...");
-  const existing = await apiCall(
-    "GET",
-    "/products/?page_size=120",
-    null,
-    primarySession,
-  );
-  if (!existing) {
-    console.error("✗ Cannot fetch products.");
-    process.exit(1);
-  }
-  console.log(`  Found ${existing.count} existing products.`);
-
-  // 3. Delete all existing products
-  console.log("\n📋 Step 3: Deleting existing products...");
+  // ── 3. Удаление всех существующих товаров ──────────────────
+  console.log("\n📋 Шаг 3: удаление всех текущих товаров");
   let deleted = 0;
-  for (const product of existing.results) {
-    // Need the owner's session to delete
-    const result = await apiCall(
-      "DELETE",
-      `/products/${product.id}/`,
-      null,
-      primarySession,
-    );
-    if (result) {
-      deleted++;
-      process.stdout.write(`\r  Deleted ${deleted}/${existing.results.length}`);
-    } else {
-      // Try with the other session
-      for (const email of Object.keys(sessions)) {
-        const r = await apiCall(
-          "DELETE",
-          `/products/${product.id}/`,
-          null,
-          sessions[email],
-        );
-        if (r) {
-          deleted++;
-          process.stdout.write(
-            `\r  Deleted ${deleted}/${existing.results.length}`,
-          );
-          break;
-        }
-      }
+  let deleteErrors = 0;
+  for (const session of sessions.values()) {
+    const mine = await fetchAll(session, "/products/mine/");
+    if (mine.length === 0) {
+      console.log(`  · ${session.sellerSlug}: товаров нет`);
+      continue;
     }
-    await sleep(2000);
+    console.log(`  · ${session.sellerSlug}: ${mine.length} товаров`);
+    for (const product of mine) {
+      if (DRY_RUN) {
+        deleted += 1;
+        continue;
+      }
+      const result = await apiCall(session, "DELETE", `/products/${product.id}/`);
+      if (result) {
+        deleted += 1;
+      } else {
+        deleteErrors += 1;
+      }
+      process.stdout.write(`\r    удалено ${deleted}, ошибок ${deleteErrors}   `);
+      await sleep(WRITE_PAUSE_MS);
+    }
+    if (mine.length > 0) console.log("");
   }
-  console.log(`\n  ✓ Deleted ${deleted} products.`);
+  console.log(`  ✓ удалено: ${deleted}${deleteErrors ? `, ошибок: ${deleteErrors}` : ""}`);
 
-  // 4. Create new products
-  console.log(`\n📋 Step 4: Creating ${PRODUCTS.length} new products...`);
+  const afterDelete = await publicGet("/products/?page_size=4");
+  console.log(`  товаров в витрине после удаления: ${afterDelete.count}`);
+  if (afterDelete.count > 0) {
+    console.warn("  ⚠ Остались товары магазинов, в чей аккаунт войти не удалось.");
+  }
+
+  // ── 4. Создание товаров из PRODUCTS ────────────────────────
+  console.log(`\n📋 Шаг 4: создание ${PRODUCTS.length} товаров`);
+  const fallback = [...sessions.values()][0];
   let created = 0;
   let failed = 0;
 
   for (const product of PRODUCTS) {
-    // Need to use the session that owns the seller
-    // seller_id=1 (Uzum Students) → seller@uzum.uz
-    // seller_id=2 (Electro House) → electro@uzum.uz
-    // For other sellers (3-10), we'll try both sessions
-    let session;
-    if (product.seller_id === 1) {
-      session = sessions["seller@uzum.uz"] || primarySession;
-    } else if (product.seller_id === 2) {
-      session = sessions["electro@uzum.uz"] || primarySession;
-    } else {
-      session = primarySession;
+    const slug = SELLER_SLUG_BY_ID[product.seller_id];
+    const session =
+      (slug ? sessions.get(slug) : undefined) ?? fallback;
+
+    // category_id в данных — порядковый номер категории сида; на сервере
+    // id могут отличаться, поэтому сначала проверяем id, потом slug.
+    let categoryId = product.category_id;
+    if (!categoryIdById.has(categoryId)) {
+      const bySlug = categoryIdBySlug.get(CATEGORY_SLUG_BY_ID[product.category_id]);
+      if (bySlug !== undefined) {
+        categoryId = bySlug;
+      } else {
+        console.error(`  ✗ нет категории для «${product.title}» (category_id=${product.category_id})`);
+        failed += 1;
+        continue;
+      }
     }
 
     const payload = {
@@ -1460,7 +1553,7 @@ async function main() {
       price: product.price,
       old_price: product.old_price,
       stock: product.stock,
-      category_id: product.category_id,
+      category_id: categoryId,
       delivery_time: product.delivery_time || "Завтра",
       brand: product.brand || "Без бренда",
       images: product.images,
@@ -1469,40 +1562,46 @@ async function main() {
       is_ad: product.is_ad || false,
     };
 
-    const result = await apiCall("POST", "/products/", payload, session);
-    if (result) {
-      created++;
-      process.stdout.write(
-        `\r  Created ${created}/${PRODUCTS.length} (failed: ${failed})`,
-      );
-    } else {
-      // Try with alternative sessions
-      let success = false;
-      for (const email of Object.keys(sessions)) {
-        if (sessions[email] === session) continue;
-        const r = await apiCall("POST", "/products/", payload, sessions[email]);
-        if (r) {
-          created++;
-          success = true;
-          process.stdout.write(
-            `\r  Created ${created}/${PRODUCTS.length} (failed: ${failed})`,
-          );
-          break;
-        }
-      }
-      if (!success) {
-        failed++;
-        console.log(`\n  ⚠ Failed to create: "${product.title}"`);
-      }
+    if (DRY_RUN) {
+      created += 1;
+      continue;
     }
-    await sleep(3000);
+
+    const result = await apiCall(session, "POST", "/products/", payload);
+    if (result) {
+      created += 1;
+    } else {
+      failed += 1;
+      console.error(`  ✗ не создан: «${product.title}»`);
+    }
+    process.stdout.write(`\r    создано ${created}/${PRODUCTS.length}, ошибок ${failed}   `);
+    await sleep(WRITE_PAUSE_MS);
+  }
+  console.log("\n");
+
+  // ── 5. Проверка ────────────────────────────────────────────
+  const after = await publicGet("/products/?page_size=4");
+  const sellersAfter = resultsOf(await publicGet("/sellers/"));
+
+  console.log("📋 Итог");
+  console.log(`  удалено товаров:        ${deleted}${deleteErrors ? ` (ошибок ${deleteErrors})` : ""}`);
+  console.log(`  создано товаров:        ${created}${failed ? ` (ошибок ${failed})` : ""}`);
+  console.log(`  товаров в витрине:      ${after.count}`);
+  for (const seller of sellersAfter) {
+    if (seller.product_count) {
+      console.log(`    · ${seller.name}: ${seller.product_count}`);
+    }
   }
 
-  console.log(`\n\n✅ Done! Created ${created} products, ${failed} failed.`);
-  console.log(`   Total products on backend should now be ${created}.\n`);
+  if (!DRY_RUN && (failed > 0 || after.count !== PRODUCTS.length)) {
+    console.warn("\n⚠ Витрина не совпадает с ожиданием — проверьте ошибки выше и запустите скрипт ещё раз.");
+    process.exit(1);
+  }
+
+  console.log(`\n✅ Готово${DRY_RUN ? " (dry run)" : ""}. Фронтенд получит ${after.count} товаров с ${BACKEND}\n`);
 }
 
-main().catch((e) => {
-  console.error("Fatal error:", e);
+main().catch((error) => {
+  console.error("Fatal error:", error);
   process.exit(1);
 });
