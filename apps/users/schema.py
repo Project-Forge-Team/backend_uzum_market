@@ -1,26 +1,18 @@
-"""Схемы авторизации для OpenAPI (drf-spectacular).
+"""Схема авторизации для OpenAPI: сессия в куке + double-submit CSRF."""
 
-Раньше spectacular не знал про наш аутентификатор и сыпал
-`could not resolve authenticator … CookieJWTAuthentication`, а Swagger «Try it out»
-не мог отправить авторизованный запрос.
-"""
-
-from django.conf import settings
 from drf_spectacular.extensions import OpenApiAuthenticationExtension
 
 
-class CookieJWTScheme(OpenApiAuthenticationExtension):
-    target_class = "apps.users.authentication.CookieJWTAuthentication"
-    name = "cookieAuth"
+class SessionCookieScheme(OpenApiAuthenticationExtension):
+    target_class = "apps.users.authentication.CookieSessionAuthentication"
+    name = "sessionCookie"
+    priority = -1
 
     def get_security_definition(self, auto_schema):
         return {
             "type": "apiKey",
             "in": "cookie",
-            "name": settings.JWT_COOKIE["ACCESS"],
-            "description": "HttpOnly cookie, выдаётся POST /api/auth/login/.",
+            "name": "uzum_sessionid",
+            "description": "Django-сессия. Unsafe-методы требуют заголовок X-CSRFToken, "
+            "равный куке uzum_csrf (double-submit, см. GET /api/auth/csrf/).",
         }
-
-    # ВНИМАНИЕ: `Authorization: Bearer` описывать отдельно не нужно — drf-spectacular
-    # подхватывает схему `jwtAuth` с родительского SimpleJWT-аутентификатора, и security
-    # для наших вьюх получается «cookieAuth ИЛИ jwtAuth».

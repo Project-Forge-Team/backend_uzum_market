@@ -1,11 +1,11 @@
 """
-Настройки проекта.
-Единый источник правды для JWT-cookie, пагинации, фильтров и безопасности.
-Адаптирован для работы как локально (localhost), так и на Render.com.
+Настройки проекта «Uzum Market Clone» (контракт BACKEND_SPEC.md, v2).
+
+Авторизация: Django-сессии в куке `uzum_sessionid` + double-submit CSRF `uzum_csrf`.
+Деньги — целые числа. Пагинация — envelope с boolean next/previous.
 """
 
 import os
-from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
@@ -44,24 +44,20 @@ def env_list(name, default=""):
 # ------------------------------------------------------------------- базовое
 SECRET_KEY = env("SECRET_KEY")
 if not SECRET_KEY:
-    raise ValueError(
-        "SECRET_KEY environment variable is not set. "
-        "Скопируйте .env.example в .env и сгенерируйте ключ."
-    )
+    raise ValueError("SECRET_KEY environment variable is not set. Скопируйте .env.example в .env и сгенерируйте ключ.")
 if len(SECRET_KEY) < 50 and not env_bool("DEBUG"):
     raise ValueError("SECRET_KEY слишком короткий для продакшена: нужно минимум 50 символов.")
 
 DEBUG = env_bool("DEBUG", False)
 
-# Добавляем .onrender.com по умолчанию для продакшена
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1,.onrender.com")
 if DEBUG and ".localhost" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS += [".localhost", "testserver"]
 
-# КРИТИЧЕСКИ ВАЖНО для Render + внешний фронтенд (Vercel/localhost)
+# Домен фронта для CSRF-форм и админки (протокол обязателен).
 CSRF_TRUSTED_ORIGINS = env_list(
-    "CSRF_TRUSTED_ORIGINS", 
-    "http://localhost:3000,http://127.0.0.1:3000,https://your-frontend-domain.vercel.app"
+    "CSRF_TRUSTED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
 )
 
 INSTALLED_APPS = [
@@ -73,15 +69,18 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "corsheaders",
     "rest_framework",
-    "rest_framework_simplejwt.token_blacklist",
-    "django_filters",
     "drf_spectacular",
+    "apps.core",
     "apps.products",
+    "apps.orders",
+    "apps.uploads",
     "apps.users",
 ]
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
+    # double-submit CSRF для /api/*: X-CSRFToken == кука uzum_csrf (§3 ТЗ)
+    "apps.core.middleware.ApiCsrfMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -115,6 +114,23 @@ TEMPLATES = [
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# ------------------------------------------------------------------- пароли
+# argon2id — как в ТЗ (§2): не md5 и не plaintext.
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
+]
+
+AUTH_USER_MODEL = "users.User"
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 8}},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+LOGIN_URL = "/admin/login/"
+LOGIN_REDIRECT_URL = "/admin/"
 
 # ------------------------------------------------------------------------- БД
 DATABASE_URL = env("DATABASE_URL")
@@ -123,7 +139,7 @@ if not DATABASE_URL:
         DATABASE_URL = f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
     else:
         raise ImproperlyConfigured(
-            "DATABASE_URL не задан. На Render это обязательная настройка (Internal Database URL)."
+            "DATABASE_URL не задан. На сервере это обязательная настройка (например, postgres://…)."
         )
 
 DATABASES = {
@@ -149,10 +165,43 @@ else:
         }
     }
 
-SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"
+# Сессии — в БД: logout и смена пароля отзывают их на сервере.
+SESSION_ENGINE = "django.contrib.sessions.backends.db"
+
+# --------------------------------------------------------------- сессии и CSRF
+# Имена и флаги — §3 ТЗ. SameSite=Lax: фронт проксирует /api через себя (§10 ТЗ).
+SESSION_COOKIE_NAME = "uzum_sessionid"
+SESSION_COOKIE_AGE = 60 * 60 * 24 * 7  # 7 дней
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SECURE = not DEBUG  # prod: только по HTTPS
+
+CSRF_COOKIE_NAME = "uzum_csrf"
+CSRF_COOKIE_HTTPONLY = False  # фронт читает куку из JS для X-CSRFToken
+CSRF_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_AGE = 60 * 60 * 24 * 365
+CSRF_HEADER_NAME = "HTTP_X_CSRFTOKEN"
+CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN") or None
+
+# CORS: только конкретный домен фронта (§1 ТЗ)
+CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-csrftoken",
+    "x-csrf-token",
+    "x-requested-with",
+]
+CORS_EXPOSE_HEADERS = ["content-encoding", "etag", "last-modified"]
 
 
-# ----------------------------------------------------------- статика и медиа
+# --------------------------------------------------------------- статика/медиа
 def _url_prefix(name, default):
     value = (env(name, default) or "").strip().strip("/")
     if not value:
@@ -160,6 +209,7 @@ def _url_prefix(name, default):
     if value.startswith(("http://", "https://")):
         return value if value.endswith("/") else value + "/"
     return f"/{value}/"
+
 
 STATIC_URL = _url_prefix("STATIC_URL", "/static/")
 STATIC_ROOT = BASE_DIR / "staticfiles"
@@ -177,6 +227,10 @@ STORAGES = {
     },
 }
 
+# Демо-картинки сида: /products/gen/*.svg (§9 ТЗ).
+SEED_MEDIA_ROOT = BASE_DIR / "seed_media"
+# Отдавать /media/ из Django (в проде статику раздаёт WhiteNoise/CDN).
+SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)
 
 # ----------------------------------------------------------------------- почта
 EMAIL_BACKEND = env(
@@ -193,126 +247,54 @@ DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "no-reply@uzum
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 
 
-# ------------------------------------------------------------------ авторизация
-AUTH_USER_MODEL = "users.User"
-
-AUTH_PASSWORD_VALIDATORS = [
-    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 8}},
-    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
-    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
-]
-
-ACCESS_TOKEN_LIFETIME = timedelta(minutes=env_int("ACCESS_TOKEN_MINUTES", 15))
-REFRESH_TOKEN_LIFETIME = timedelta(days=env_int("REFRESH_TOKEN_DAYS", 7))
-
-SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": ACCESS_TOKEN_LIFETIME,
-    "REFRESH_TOKEN_LIFETIME": REFRESH_TOKEN_LIFETIME,
-    "AUTH_HEADER_TYPES": ("Bearer",),
-    "USER_ID_FIELD": "id",
-    "USER_ID_CLAIM": "user_id",
-    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
-    "TOKEN_TYPE_CLAIM": "token_type",
-    "JTI_CLAIM": "jti",
-    "ROTATE_REFRESH_TOKENS": env_bool("JWT_ROTATE_REFRESH", True),
-    "BLACKLIST_AFTER_ROTATION": env_bool("JWT_BLACKLIST_AFTER_ROTATION", True),
-    "UPDATE_LAST_LOGIN": False,
-    "ALGORITHM": "HS256",
-    "SIGNING_KEY": SECRET_KEY,
-}
-
-# ==============================================================================
-# 🔥 ИСПРАВЛЕННЫЙ БЛОК COOKIE И CORS (Ключ к решению вашей проблемы)
-# ==============================================================================
-
-# 1. Имя CSRF куки должно совпадать с тем, что ждет фронтенд (uzum_csrf)
-CSRF_COOKIE_NAME = env("CSRF_COOKIE_NAME", "uzum_csrf")
-
-# 2. Логика SameSite и Secure:
-# Локально (DEBUG=True): Lax, Secure=False (разрешено на http://localhost)
-# Продакшен (DEBUG=False): None, Secure=True (обязательно для кросс-доменных запросов на https)
-_COOKIE_SAMESITE_DEFAULT = "Lax" if DEBUG else "None"
-_COOKIE_SECURE_DEFAULT = False if DEBUG else True
-
-COOKIE_SAMESITE = env("COOKIE_SAMESITE", _COOKIE_SAMESITE_DEFAULT)
-COOKIE_SECURE = env_bool("COOKIE_SECURE", _COOKIE_SECURE_DEFAULT)
-
-if COOKIE_SAMESITE.lower() == "none" and not COOKIE_SECURE:
-    raise ValueError("SameSite=None требует Secure=True (браузер отклонит такую cookie).")
-
-JWT_COOKIE = {
-    "ACCESS": env("ACCESS_COOKIE_NAME", "uzum_access_token"),
-    "REFRESH": env("REFRESH_COOKIE_NAME", "uzum_refresh_token"),
-    "SECURE": COOKIE_SECURE,
-    "SAMESITE": COOKIE_SAMESITE,
-    "HTTP_ONLY": env_bool("COOKIE_HTTP_ONLY", True),
-    "ACCESS_PATH": env("ACCESS_COOKIE_PATH", "/"),
-    "REFRESH_PATH": env("REFRESH_COOKIE_PATH", "/api/auth/"),
-    "CSRF_NAME": CSRF_COOKIE_NAME,
-}
-
-# 3. CORS: Читаем из .env, запрещаем "все подряд" при использовании credentials
-CORS_ALLOWED_ORIGINS = env_list(
-    "CORS_ALLOWED_ORIGINS", 
-    "http://localhost:3000,http://127.0.0.1:3000,https://your-frontend-domain.vercel.app"
-)
-CORS_ALLOW_ALL_ORIGINS = False  # ВАЖНО: Должно быть False при использовании куки!
-CORS_ALLOW_CREDENTIALS = True
-
-CORS_ALLOW_HEADERS = [
-    "accept",
-    "accept-encoding",
-    "authorization",
-    "content-type",
-    "user-agent",
-    "x-csrftoken",
-    "x-requested-with",
-    "x-csrf-token",
-]
-CORS_EXPOSE_HEADERS = ["content-encoding", "etag", "last-modified", "set-cookie"]
-
-# ==============================================================================
-
+# ------------------------------------------------------------------------ DRF
 REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
-    "DEFAULT_PAGINATION_CLASS": "apps.products.pagination.CatalogPagination",
-    "DEFAULT_FILTER_BACKENDS": [
-        "django_filters.rest_framework.DjangoFilterBackend",
-        "rest_framework.filters.SearchFilter",
-        "rest_framework.filters.OrderingFilter",
-    ],
-    "DEFAULT_AUTHENTICATION_CLASSES": [
-        "apps.users.authentication.CookieJWTAuthentication",
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
-    ],
+    "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.EnvelopePagination",
+    "PAGE_SIZE": 20,
+    "DEFAULT_AUTHENTICATION_CLASSES": ["apps.users.authentication.CookieSessionAuthentication"],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
-    "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.ScopedRateThrottle"],
+    "DEFAULT_THROTTLE_CLASSES": ["apps.core.throttling.ScopedIpThrottle"],
     "DEFAULT_THROTTLE_RATES": {
+        "csrf": env("THROTTLE_CSRF", "60/min"),
         "login": env("THROTTLE_LOGIN", "10/min"),
-        "register": env("THROTTLE_REGISTER", "5/hour"),
-        "refresh": env("THROTTLE_REFRESH", "60/hour"),
+        "register": env("THROTTLE_REGISTER", "10/min"),
+        "password": env("THROTTLE_PASSWORD", "10/min"),
+        "product_write": env("THROTTLE_PRODUCT_WRITE", "60/hour"),
     },
-    "EXCEPTION_HANDLER": "apps.users.exceptions.api_exception_handler",
+    "EXCEPTION_HANDLER": "apps.core.exceptions.api_exception_handler",
     "NON_FIELD_ERRORS_KEY": "detail",
     "COERCE_DECIMAL_TO_STRING": True,
+    "UNAUTHENTICATED_USER": "django.contrib.auth.models.AnonymousUser",
 }
 
-# ------------------------------------------------------------------- продакшен
+# ------------------------------------------------------------------ OpenAPI
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Uzum Market Clone API",
+    "DESCRIPTION": "Маркетплейс: каталог, заказы, отзывы, кабинеты покупателя и продавца. Контракт — BACKEND_SPEC.md.",
+    "VERSION": "2.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "SCHEMA_PATH_PREFIX": "/api",
+    "COMPONENT_SPLIT_REQUEST": True,
+    "ENUM_GENERATE_CHOICE_DESCRIPTION": False,
+    "TAGS": [
+        {"name": "auth", "description": "Регистрация, вход, профиль"},
+        {"name": "products", "description": "Каталог товаров"},
+        {"name": "categories", "description": "Категории"},
+        {"name": "sellers", "description": "Магазины"},
+        {"name": "reviews", "description": "Отзывы и ответы продавца"},
+        {"name": "orders", "description": "Заказы и статусы"},
+        {"name": "shop", "description": "Кабинет продавца"},
+        {"name": "uploads", "description": "Загрузка картинок"},
+        {"name": "service", "description": "Health и demo-reset"},
+    ],
+}
+
+# ------------------------------------------------------------------ продакшен
 if not DEBUG:
-    # Render использует прокси, поэтому этот заголовок критически важен для определения HTTPS
+    # За прокси (Render/nginx) HTTPS определяется по X-Forwarded-Proto.
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", True)
-    
-    # Принудительно применяем безопасные настройки куки для продакшена
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
-    SESSION_COOKIE_SAMESITE = COOKIE_SAMESITE
-    CSRF_COOKIE_SAMESITE = COOKIE_SAMESITE
-    CSRF_COOKIE_DOMAIN = env("CSRF_COOKIE_DOMAIN") or None
-    
-    # Фронтенд ДОЛЖЕН читать эту куку через JS, поэтому HttpOnly = False
-    CSRF_COOKIE_HTTPONLY = False  
 
     SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 31_536_000)
     SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
@@ -321,33 +303,23 @@ if not DEBUG:
     SECURE_REFERRER_POLICY = "same-origin"
     X_FRAME_OPTIONS = "DENY"
 
-SILENCED_SYSTEM_CHECKS = ["security.W005", "security.W021"]
-
+SILENCED_SYSTEM_CHECKS = ["security.W021"]  # .csrf: Lax-куки — осознанно (фронт проксирует /api)
 
 # ------------------------------------------------------------------------- i18n
-LANGUAGE_CODE = env("LANGUAGE_CODE", "ru-ru") # Изменил на русский по умолчанию
-TIME_ZONE = "Asia/Tashkent" # Или "UTC", как вам удобнее
+LANGUAGE_CODE = env("LANGUAGE_CODE", "ru-ru")
+TIME_ZONE = env("TIME_ZONE", "Asia/Tashkent")
 USE_I18N = True
 USE_TZ = True
 
+# --------------------------------------------------------------- служебные env
+BACKEND_ID = env("BACKEND_ID", "django")  # в /api/health: какая реализация отвечает
+LOCK_DEMO = env_bool("UZUM_LOCK_DEMO", False)  # POST /api/demo/reset/ → 403
+SEED_DEMO_DATA = env_bool("SEED_DEMO_DATA", True)
 
-# ----------------------------------------------------------------- OpenAPI
-SPECTACULAR_SETTINGS = {
-    "TITLE": "Uzum Market API",
-    "DESCRIPTION": "Каталог товаров, категории, продавцы и JWT-авторизация в HttpOnly cookies.",
-    "VERSION": "1.2.0",
-    "SERVE_INCLUDE_SCHEMA": False,
-    "SCHEMA_PATH_PREFIX": "/api",
-    "COMPONENT_SPLIT_REQUEST": True,
-    "ENUM_GENERATE_CHOICE_DESCRIPTION": False,
-    "TAGS": [
-        {"name": "auth", "description": "Регистрация, логин, profile"},
-        {"name": "products", "description": "Каталог товаров"},
-        {"name": "categories", "description": "Категории"},
-        {"name": "sellers", "description": "Продавцы"},
-    ],
-}
-
+# Потолок тела запроса: покрывает multipart-картинки до 2 МБ (§7 ТЗ).
+# (Django ограничивает и JSON, и multipart одной настройкой.)
+DATA_UPLOAD_MAX_MEMORY_SIZE = 3 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
 
 # ------------------------------------------------------------------------- лог
 LOGGING = {
@@ -366,8 +338,3 @@ LOGGING = {
         "apps": {"handlers": ["console"], "level": env("LOG_LEVEL", "INFO"), "propagate": False},
     },
 }
-
-PAGE_SIZE = env_int("PAGE_SIZE", 10)
-PAGE_SIZE_MAX = env_int("PAGE_SIZE_MAX", 100)
-CATALOG_CACHE_SECONDS = env_int("CATALOG_CACHE_SECONDS", 60)
-SERVE_MEDIA = env_bool("SERVE_MEDIA", DEBUG)

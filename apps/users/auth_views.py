@@ -1,36 +1,43 @@
-"""Auth-API: JWT в HttpOnly cookies (+ поддержка Authorization: Bearer).
+"""Auth-API: сессии в HttpOnly-cookie + double-submit CSRF (§3, §5.1 ТЗ).
 
-Один стиль для всех эндпоинтов: токены НЕ возвращаются в теле, они кладутся в cookie.
-Это закрывает и расхождение с документацией, и XSS-вектор с localStorage.
+Вход/выход ставят/снимают ОБЕ куки (uzum_sessionid + uzum_csrf) одним ответом.
+Токены и хэши в теле ответа отсутствуют.
 """
 
 import logging
 
-from django.core.exceptions import ObjectDoesNotExist
-from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import ensure_csrf_cookie
+from django.conf import settings
+from django.contrib.auth import login, logout
 from drf_spectacular.utils import extend_schema
-from rest_framework import generics, permissions, status
+from rest_framework import exceptions, permissions, serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
-from rest_framework_simplejwt.serializers import TokenRefreshSerializer
-from rest_framework_simplejwt.tokens import RefreshToken
 
-from .cookies import clear_auth_cookies, get_refresh_token, set_auth_cookies, tokens_for_user
-from .permissions import CrossSiteCsrfProtect
-from .serializers import EmailTokenObtainPairSerializer, RegisterSerializer, UserSerializer
-from .throttling import ProxyAwareScopedRateThrottle
+from apps.core.cache import cache_private
+
+from .authentication import CookieSessionAuthentication
+from .serializers import (
+    LoginSerializer,
+    MeUpdateSerializer,
+    PasswordSerializer,
+    RegisterSerializer,
+    UserSerializer,
+)
+from .throttling import ScopedIpThrottle
 
 logger = logging.getLogger(__name__)
 
 
 class AuthAPIView(APIView):
-    """Общее для всех auth-эндпоинтов: CSRF-защита cookie-флоу + троттлинг."""
+    """Общее для auth-эндпоинтов: троттлинг по IP.
 
-    serializer_class = None
-    permission_classes = [CrossSiteCsrfProtect]
-    throttle_classes = [ProxyAwareScopedRateThrottle]
+    Аутентификатор нужен даже анонимным view: без него DRF не может построить
+    WWW-Authenticate и рендерит 401 как 403.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = [CookieSessionAuthentication]
+    throttle_classes = [ScopedIpThrottle]
 
     def get_serializer_context(self):
         return {"request": self.request, "format": self.format_kwarg, "view": self}
@@ -40,136 +47,163 @@ class AuthAPIView(APIView):
         return self.serializer_class(*args, **kwargs)
 
 
-@extend_schema(tags=["auth"])
-class RegisterView(generics.CreateAPIView):
-    """POST /api/auth/register/ — регистрация + сразу авторизованные cookies."""
+def issue_csrf_token(request) -> str:
+    """Выдаёт CSRF-токен для double-submit.
+
+    Формат — 64 hex-символа, как нативный токен Django: тогда нативная проверка
+    (админка) и наша double-submit-проверка живут на одной куке без конфликтов.
+    Уже выданный валидный токен переиспользуется (токен стабилен на браузер).
+    """
+    import re
+    import secrets
+
+    current = request.COOKIES.get(settings.CSRF_COOKIE_NAME, "")
+    if re.fullmatch(r"[0-9a-f]{64}", current):
+        token = current
+    else:
+        token = secrets.token_hex(32)
+    # Django-механика (админка/формы) продолжит работать с этим же токеном.
+    raw_request = request._request if hasattr(request, "_request") else request
+    raw_request.META["CSRF_COOKIE"] = token
+    raw_request.META.pop("CSRF_COOKIE_MASKED", None)
+    return token
+
+
+def ensure_csrf_cookie(request, response, token: str | None = None):
+    """Ставит куку uzum_csrf (без HttpOnly — фронт читает из JS).
+
+    `token` передаётся, когда он уже сгенерирован (иначе каждый вызов создавал бы новый).
+    """
+    if token is None:
+        token = issue_csrf_token(request)
+    response.set_cookie(
+        settings.CSRF_COOKIE_NAME,
+        token,
+        max_age=60 * 60 * 24 * 365,
+        domain=settings.CSRF_COOKIE_DOMAIN or None,
+        path="/",
+        secure=settings.CSRF_COOKIE_SECURE,
+        samesite=settings.CSRF_COOKIE_SAMESITE,
+        httponly=False,
+    )
+    return response
+
+
+class CsrfView(AuthAPIView):
+    """GET /api/auth/csrf/ — бустрап double-submit CSRF-токена."""
+
+    throttle_scope = "csrf"
+    serializer_class = None
+
+    @extend_schema(tags=["auth"], responses={200: None})
+    def get(self, request):
+        token = issue_csrf_token(request)
+        response = Response({"detail": "CSRF cookie issued", "csrf": token})
+        return ensure_csrf_cookie(request, response, token=token)
+
+
+class RegisterView(AuthAPIView):
+    """POST /api/auth/register/ — профиль + автоматически созданный магазин + куки."""
 
     serializer_class = RegisterSerializer
-    permission_classes = [permissions.AllowAny, CrossSiteCsrfProtect]
-    authentication_classes = []
-    throttle_classes = [ProxyAwareScopedRateThrottle]
     throttle_scope = "register"
 
-    @extend_schema(
-        request=RegisterSerializer,
-        responses={201: UserSerializer},
-    )
-    def post(self, request, *args, **kwargs):
+    @extend_schema(tags=["auth"], request=RegisterSerializer, responses={201: UserSerializer})
+    def post(self, request):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-
-        refresh, access = tokens_for_user(user)
+        login(request._request, user)
         response = Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
-        return set_auth_cookies(request, response, access=access, refresh=refresh)
+        return ensure_csrf_cookie(request, response)
 
 
-@extend_schema(tags=["auth"])
 class LoginView(AuthAPIView):
-    """POST /api/auth/login/ — вход по email + паролю, токены уходят в HttpOnly cookies."""
+    """POST /api/auth/login/ — вход: профиль + обе куки."""
 
-    serializer_class = EmailTokenObtainPairSerializer
-    permission_classes = [permissions.AllowAny, CrossSiteCsrfProtect]
-    throttle_classes = [ProxyAwareScopedRateThrottle]
+    serializer_class = LoginSerializer
     throttle_scope = "login"
 
-    @extend_schema(request=EmailTokenObtainPairSerializer, responses={200: UserSerializer})
-    def post(self, request, *args, **kwargs):
+    @extend_schema(tags=["auth"], request=LoginSerializer, responses={200: UserSerializer})
+    def post(self, request):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
-        user = getattr(serializer, "user", None)
-        if user is None:  # фолбэк на случай изменения внутреннего API simplejwt
-            from django.contrib.auth import get_user_model
-            from rest_framework_simplejwt.tokens import AccessToken
-
-            access = serializer.validated_data["access"]
-            user = get_user_model().objects.get(pk=AccessToken(str(access))["user_id"])
-
+        user = serializer.validated_data["user"]
+        login(request._request, user)
         response = Response(UserSerializer(user).data, status=status.HTTP_200_OK)
-        return set_auth_cookies(
-            request,
-            response,
-            access=serializer.validated_data["access"],
-            refresh=serializer.validated_data.get("refresh"),
-        )
+        return ensure_csrf_cookie(request, response)
 
 
-@extend_schema(tags=["auth"])
-class RefreshView(AuthAPIView):
-    """POST /api/auth/refresh/ — новый access (и, при ротации, новый refresh) из cookie."""
-
-    serializer_class = TokenRefreshSerializer
-    permission_classes = [permissions.AllowAny, CrossSiteCsrfProtect]
-    throttle_classes = [ProxyAwareScopedRateThrottle]
-    throttle_scope = "refresh"
-
-    @extend_schema(request=None, responses={204: None})
-    def post(self, request, *args, **kwargs):
-        refresh_token = get_refresh_token(request)
-        if not refresh_token:
-            return clear_auth_cookies(
-                Response({"detail": "Refresh token not found in cookies."}, status=status.HTTP_401_UNAUTHORIZED)
-            )
-
-        serializer = self.serializer_class(data={"refresh": refresh_token}, context={"request": request})
-        try:
-            serializer.is_valid(raise_exception=True)
-        except (InvalidToken, TokenError, ObjectDoesNotExist):
-            return clear_auth_cookies(
-                Response({"detail": "Token is invalid or expired."}, status=status.HTTP_401_UNAUTHORIZED)
-            )
-
-        response = Response(status=status.HTTP_204_NO_CONTENT)
-        return set_auth_cookies(
-            request,
-            response,
-            access=serializer.validated_data.get("access"),
-            refresh=serializer.validated_data.get("refresh"),
-        )
-
-
-@extend_schema(tags=["auth"])
 class LogoutView(AuthAPIView):
-    """POST /api/auth/logout/ — отзыв refresh-токена (блэклист) + чистка cookies."""
+    """POST /api/auth/logout/ — выход, куки чистятся (идемпотентно, работает и анонимно)."""
 
-    permission_classes = [permissions.AllowAny, CrossSiteCsrfProtect]
+    serializer_class = serializers.Serializer
+    throttle_classes = []
 
-    @extend_schema(request=None, responses={200: None})
-    def post(self, request, *args, **kwargs):
-        raw = get_refresh_token(request)
-        if raw:
-            try:
-                RefreshToken(raw).blacklist()
-            except TokenError:
-                pass  # уже отозван/истёк/blacklist-приложение выключено
-            except Exception:
-                logger.exception("Не удалось добавить refresh-токен в блэклист")
-
-        response = Response({"detail": "Successfully logged out."}, status=status.HTTP_200_OK)
-        return clear_auth_cookies(response)
+    @extend_schema(tags=["auth"], responses={200: None})
+    def post(self, request):
+        if request.session.session_key or request.user.is_authenticated:
+            logout(request._request)
+        response = Response({"detail": "Вы вышли из аккаунта"}, status=status.HTTP_200_OK)
+        response.delete_cookie(settings.SESSION_COOKIE_NAME, path="/")
+        response.delete_cookie(settings.CSRF_COOKIE_NAME, path="/")
+        return response
 
 
-@extend_schema(tags=["auth"])
-@method_decorator(ensure_csrf_cookie, name='dispatch') # 🔥 ГАРАНТИРОВАННО заставляет Django отправить Set-Cookie
-class CsrfView(APIView):
-    """GET /api/auth/csrf/ — бустрап double-submit CSRF-токена."""
-
-    permission_classes = [permissions.AllowAny]
-    authentication_classes = [] # 🔥 Явно отключаем, аутентификация здесь не нужна
-
-    @extend_schema(responses={200: None})
-    def get(self, request, *args, **kwargs):
-        # Благодаря декоратору выше, Django сам добавит заголовок Set-Cookie с токеном
-        return Response({"detail": "CSRF cookie set"}, status=status.HTTP_200_OK)
+class MeNotAuthenticated(exceptions.NotAuthenticated):
+    def __init__(self):
+        super().__init__(detail="Вы не авторизованы")
 
 
-@extend_schema(tags=["auth"])
-class MeView(generics.RetrieveAPIView):
-    """GET /api/auth/me/ — профиль текущего пользователя (cookie или Bearer)."""
+class IsAuthenticatedForMe(permissions.BasePermission):
+    message = "Вы не авторизованы"
+
+    def has_permission(self, request, view):
+        if request.user and request.user.is_authenticated:
+            return True
+        raise MeNotAuthenticated()
+
+
+class MeView(APIView):
+    """GET/PATCH /api/auth/me/ — профиль текущего пользователя.
+
+    401 с текстом «Вы не авторизованы» (§3 ТЗ) — фронт по нему включает гостевой режим.
+    """
 
     serializer_class = UserSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [CookieSessionAuthentication]
+    permission_classes = [IsAuthenticatedForMe]
 
-    def get_object(self):
-        return self.request.user
+    @extend_schema(tags=["auth"], responses={200: UserSerializer})
+    def get(self, request):
+        return cache_private(Response(UserSerializer(request.user).data), request)
+
+    @extend_schema(tags=["auth"], request=MeUpdateSerializer, responses={200: UserSerializer})
+    def patch(self, request):
+        serializer = MeUpdateSerializer(request.user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return cache_private(Response(UserSerializer(request.user).data), request)
+
+
+class PasswordView(APIView):
+    """POST /api/auth/password/ — смена пароля + инвалидация прочих сессий."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedIpThrottle]
+    throttle_scope = "password"
+
+    @extend_schema(tags=["auth"], request=PasswordSerializer, responses={200: None})
+    def post(self, request):
+        serializer = PasswordSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        user.set_password(serializer.validated_data["next"])
+        user.save(update_fields=["password", "password_updated_at"])
+
+        # Прочие сессии инвалидируются сами: в django_session лежит _auth_user_hash,
+        # посчитанный от старого пароля. Текущую продлеваем новым хэшем, чтобы
+        # не разлогинивать человека посреди смены пароля (should из ТЗ).
+        request.session["_auth_user_hash"] = user.get_session_auth_hash()
+
+        return Response({"detail": "Пароль обновлён"}, status=status.HTTP_200_OK)

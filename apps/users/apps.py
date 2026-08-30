@@ -8,6 +8,5 @@ class UsersConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
 
     def ready(self):
-        # Регистрирует OpenApiAuthenticationExtension для нашего аутентификатора,
-        # иначе spectacular не знает, как описать cookie/Bearer-безопасность.
+        # Регистрирует OpenApiAuthenticationExtension для сессионного аутентификатора.
         from . import schema  # noqa: F401
