@@ -1,53 +1,50 @@
 from django.contrib import admin
 
-from .models import Category, Product, Seller
+from .models import Category, Product, Review, Seller
+
+
+class ReviewInline(admin.TabularInline):
+    model = Review
+    extra = 0
+    fields = ["author", "rating", "text", "verified", "seller_reply", "created_at"]
+    readonly_fields = ["created_at"]
 
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "slug", "products_count")
-    list_display_links = ("name",)
-    search_fields = ("name", "slug")
-    prepopulated_fields = {"slug": ("name",)}
+    list_display = ["emoji", "name", "slug", "color"]
+    list_display_links = ["name"]
+    search_fields = ["name", "slug"]
     list_per_page = 50
-
-    @admin.display(description="Товаров")
-    def products_count(self, obj):
-        return obj.products_total  # из annotate() — иначе N+1 на каждую строку списка
-
-    def get_queryset(self, request):
-        from django.db.models import Count
-
-        return super().get_queryset(request).annotate(products_total=Count("products", distinct=True))
 
 
 @admin.register(Seller)
 class SellerAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "rating", "reviews_count")
-    list_display_links = ("name",)
-    search_fields = ("name",)
-    ordering = ("-rating",)
+    list_display = ["name", "slug", "city", "owner", "rating", "reviews_count", "verified"]
+    list_display_links = ["name"]
+    search_fields = ["name", "slug", "city"]
+    list_filter = ["verified", "city"]
+    list_select_related = ["owner"]
     list_per_page = 50
 
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ("id", "title", "price", "old_price", "rating", "category", "seller", "is_ad", "created_at")
-    # Без list_select_related list_display по category/seller = 21 запрос на страницу
-    # вместо 1 (замерено на 20 000 товаров).
-    list_select_related = ("category", "seller")
-    list_filter = ("category", "is_ad", "seller")
-    search_fields = ("title", "description")
+    list_display = ["title", "seller", "category", "price", "stock", "status", "is_ad", "views", "rating"]
+    list_display_links = ["title"]
+    list_filter = ["status", "is_ad", "category"]
+    search_fields = ["title", "brand", "slug"]
+    list_select_related = ["seller", "category"]
     date_hierarchy = "created_at"
-    ordering = ("-created_at",)
     list_per_page = 50
-    autocomplete_fields = ()
-    readonly_fields = ("created_at", "updated_at")
-    fieldsets = (
-        (None, {"fields": ("title", "description", "is_ad")}),
-        ("Цены", {"fields": ("price", "old_price", "monthly_payment")}),
-        ("Медиа", {"fields": ("image", "images", "characteristics")}),
-        ("Продавец и категория", {"fields": ("seller", "category", "delivery_time")}),
-        ("Рейтинг", {"fields": ("rating", "reviews_count")}),
-        ("Служебное", {"fields": ("created_at", "updated_at")}),
-    )
+    inlines = [ReviewInline]
+
+
+@admin.register(Review)
+class ReviewAdmin(admin.ModelAdmin):
+    list_display = ["author", "product", "rating", "verified", "seller_reply", "created_at"]
+    list_select_related = ["product"]
+    search_fields = ["author", "text"]
+    list_filter = ["rating", "verified"]
+    date_hierarchy = "created_at"
+    list_per_page = 50

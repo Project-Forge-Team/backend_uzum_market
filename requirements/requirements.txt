@@ -1,25 +1,25 @@
 # Прямые зависимости приложения (транзитивные тянет pip).
-# Файл в UTF-8 / LF: раньше лежал в UTF-16LE+BOM, из-за чего git diff показывал
-# «Binary files differ», а Dependabot/pip-compile/grep его не видели.
+# Файл в UTF-8 / LF.
 #
-# Python: >=3.12 (см. .python-version) — Django 6.1 не ставится на 3.11.
+# Python: >=3.12 (см. .python-version). Локально в песочнице — 3.11 + Django 5.2,
+# на сервере/CI (3.12+) ставится свежий Django 6.x. Код не использует
+# версии-специфичные API, поэтому диапазон: >=5.2,<7.
 
-Django==6.1
+Django>=5.2,<7
 djangorestframework==3.18.0
-djangorestframework-simplejwt==5.5.1
 django-cors-headers==4.9.0
-django-filter==26.1
 drf-spectacular==0.30.0
 dj-database-url==3.1.2
 whitenoise==6.12.0
 python-dotenv==1.2.3
-pillow==12.3.0
+argon2-cffi==25.1.0
 gunicorn==26.1.0
 
-# Драйвер Postgres: Django 6.x рекомендует psycopg 3 (он же включает пул соединений,
-# который используется conn_health_checks/CONN_MAX_AGE). psycopg2-binary больше не нужен.
+# Миниатюры/размеры загруженных картинок (width/height в media_files).
+pillow==12.3.0
+
+# Драйвер Postgres: Django 6.x рекомендует psycopg 3.
 psycopg[binary]==3.3.4
 
-# Нужен только при заданном REDIS_URL (общие счётчики троттлинга и кэш каталога
-# между worker'ами). Без него CACHES = LocMem (свои на каждый процесс).
+# Нужен только при заданном REDIS_URL (общие счётчики троттлинга между worker'ами).
 redis==8.1.0

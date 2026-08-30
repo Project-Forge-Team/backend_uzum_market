@@ -1,338 +1,321 @@
-"""Тесты авторизации.
+"""Тесты авторизации (§3, §5.1 ТЗ)."""
 
-Каждый тест закрывает конкретный баг из AUDIT.md — так расхождение «docs vs код»
-больше не вернётся незаметно.
-"""
-
-import io
-from datetime import timedelta
-
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.management import call_command
-from django.core.management.base import CommandError
-from django.test import TestCase, override_settings
-from rest_framework import status
-from rest_framework.test import APITestCase
-from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
+from django.contrib.sessions.models import Session
+from django.test import TestCase
+from rest_framework.test import APIClient
 
 User = get_user_model()
 
-PASSWORD = "Str0ng-Pass-99"
+PASSWORD = "Password123"
 
 
-def register(client, email="user@example.com", **extra):
-    payload = {"email": email, "password": PASSWORD, "password2": PASSWORD}
-    payload.update(extra)
-    return client.post("/api/auth/register/", payload, format="json")
+def csrf_of(client: APIClient) -> str:
+    response = client.get("/api/auth/csrf/")
+    assert response.status_code == 200, response.content
+    return response.json()["csrf"]
 
 
-class RegisterTests(APITestCase):
-    def test_sets_cookies_and_no_tokens_in_body(self):
-        """AUDIT B-2: токены не уезжают в теле, но cookie ставятся — клиент залогинен сразу."""
-        response = register(self.client, first_name="Ivan", phone="+998901234567")
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        body = response.json()
-        self.assertNotIn("access", body)
-        self.assertNotIn("refresh", body)
-        self.assertEqual(body["email"], "user@example.com")
-        self.assertEqual(body["first_name"], "Ivan")
-        cookies = {c.key: c for c in self.client.cookies.values()}
-        self.assertIn("uzum_access_token", cookies)
-        self.assertIn("uzum_refresh_token", cookies)
-        self.assertTrue(cookies["uzum_access_token"]["httponly"])
+class AuthClient(APIClient):
+    """Клиент с автоматическим X-CSRFToken из куки (как фронт)."""
 
-    def test_email_normalized_and_me_works(self):
-        response = register(self.client, email="  PrObe@Example.COM  ")
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(User.objects.get().email, "probe@example.com")
-        self.assertEqual(self.client.get("/api/auth/me/").json()["email"], "probe@example.com")
-
-    def test_duplicate_email_different_case_is_400_not_500(self):
-        register(self.client, email="user@example.com")
-        response = register(self.client, email="USER@example.com")
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("email", response.json())
-
-    def test_password_mismatch(self):
-        response = self.client.post(
-            "/api/auth/register/",
-            {"email": "a@b.co", "password": PASSWORD, "password2": "another-one"},
-            format="json",
+    def csrf_post(self, path, data=None, format="json", **extra):
+        extra.setdefault(
+            "HTTP_X_CSRFTOKEN",
+            self.cookies.get(settings.CSRF_COOKIE_NAME).value
+            if settings.CSRF_COOKIE_NAME in self.cookies
+            else csrf_of(self),
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("password2", response.json())
+        return self.post(path, data, format=format, **extra)
 
-    def test_weak_password_rejected(self):
-        response = self.client.post(
-            "/api/auth/register/",
-            {"email": "a@b.co", "password": "12345678", "password2": "12345678"},
-            format="json",
+    def csrf_patch(self, path, data=None, **extra):
+        extra.setdefault(
+            "HTTP_X_CSRFTOKEN",
+            self.cookies.get(settings.CSRF_COOKIE_NAME).value
+            if settings.CSRF_COOKIE_NAME in self.cookies
+            else csrf_of(self),
         )
-        self.assertEqual(response.status_code, 400)
+        return self.patch(path, data, format="json", **extra)
 
-    def test_phone_validation(self):
-        response = register(self.client, phone="не-телефон")
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("phone", response.json())
-
-
-class LoginTests(APITestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="user@example.com", password=PASSWORD)
-
-    def test_login_case_insensitive(self):
-        """AUDIT B-5: регистрация lower()-ит email, поэтому вход обязан быть регистронезависимым."""
-        response = self.client.post(
-            "/api/auth/login/", {"email": "UsEr@Example.COM", "password": PASSWORD}, format="json"
+    def csrf_put(self, path, data=None, **extra):
+        extra.setdefault(
+            "HTTP_X_CSRFTOKEN",
+            self.cookies.get(settings.CSRF_COOKIE_NAME).value
+            if settings.CSRF_COOKIE_NAME in self.cookies
+            else csrf_of(self),
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["id"], self.user.id)
+        return self.put(path, data, format="json", **extra)
 
-    def test_wrong_password(self):
-        response = self.client.post(
-            "/api/auth/login/", {"email": "user@example.com", "password": "nope-nope-nope"}, format="json"
+    def csrf_delete(self, path, **extra):
+        extra.setdefault(
+            "HTTP_X_CSRFTOKEN",
+            self.cookies.get(settings.CSRF_COOKIE_NAME).value
+            if settings.CSRF_COOKIE_NAME in self.cookies
+            else csrf_of(self),
         )
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        return self.delete(path, **extra)
 
-    def test_cookie_flags_follow_settings(self):
-        self.client.post("/api/auth/login/", {"email": "user@example.com", "password": PASSWORD}, format="json")
-        cookie = self.client.cookies["uzum_access_token"]
-        self.assertEqual(cookie["samesite"], "Lax")
-        self.assertEqual(cookie["path"], "/")
-        self.assertTrue(cookie["httponly"])
-        self.assertEqual(int(cookie["max-age"]), int(timedelta(seconds=2).total_seconds()))
-        # refresh не светится на весь домен
-        self.assertEqual(self.client.cookies["uzum_refresh_token"]["path"], "/api/auth/")
-
-    @override_settings(
-        JWT_COOKIE={
-            "ACCESS": "uzum_access_token",
-            "REFRESH": "uzum_refresh_token",
-            "CSRF_NAME": "csrftoken",
-            "SECURE": True,
-            "SAMESITE": "None",
-            "HTTP_ONLY": True,
-            "ACCESS_PATH": "/",
-            "REFRESH_PATH": "/api/auth/",
-            "DOMAIN": None,
-        }
-    )
-    def test_cross_site_mode_requires_csrf_header(self):
-        """AUDIT A-1: при SameSite=None cookie шлются на любой сайт → без CSRF-токена отказ."""
-        denied = self.client.post(
-            "/api/auth/login/", {"email": "user@example.com", "password": PASSWORD}, format="json"
-        )
-        self.assertEqual(denied.status_code, 403)
-
-        from django.conf import settings as st
-
-        csrf = self.client.get("/api/auth/csrf/")
-        self.assertEqual(csrf.status_code, 200)
-        token = self.client.cookies[st.JWT_COOKIE["CSRF_NAME"]].value
-        allowed = self.client.post(
+    def login_as(self, email: str, password: str = PASSWORD):
+        csrf = csrf_of(self)
+        response = self.post(
             "/api/auth/login/",
-            {"email": "user@example.com", "password": PASSWORD},
+            {"email": email, "password": password},
             format="json",
-            headers={"X-CSRFToken": token},
+            HTTP_X_CSRFTOKEN=csrf,
         )
-        self.assertEqual(allowed.status_code, 200)
-
-    def test_login_is_throttled(self):
-        """AUDIT C-3: перебор паролей должен упираться в лимит, а не в бесконечность."""
-        from django.conf import settings
-
-        limited = {
-            **settings.REST_FRAMEWORK,
-            "DEFAULT_THROTTLE_RATES": {"login": "3/min", "register": "3/min", "refresh": "3/min"},
-        }
-        with override_settings(REST_FRAMEWORK=limited):
-            codes = [
-                self.client.post(
-                    "/api/auth/login/", {"email": "user@example.com", "password": "bad-password-1"}, format="json"
-                ).status_code
-                for _ in range(6)
-            ]
-        self.assertIn(status.HTTP_429_TOO_MANY_REQUESTS, codes)
+        assert response.status_code == 200, response.content
+        return response
 
 
-class TokenLifecycleTests(APITestCase):
+def make_user(email="user@example.com", password=PASSWORD, **kwargs):
+    kwargs.setdefault("first_name", "Тест")
+    return User.objects.create_user(email=email, password=password, **kwargs)
+
+
+class CsrfFlowTests(TestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email="user@example.com", password=PASSWORD)
-        login = self.client.post("/api/auth/login/", {"email": "user@example.com", "password": PASSWORD}, format="json")
-        self.assertEqual(login.status_code, 200)
+        self.client = AuthClient()
 
-    def test_refresh_accepts_form_encoded_body(self):
-        """AUDIT A-3: 500 AttributeError на неизменяемом QueryDict."""
+    def test_csrf_issues_cookie_and_token(self):
+        response = self.client.get("/api/auth/csrf/")
+        body = response.json()
+        self.assertEqual(body["detail"], "CSRF cookie issued")
+        cookie = response.cookies[settings.CSRF_COOKIE_NAME]
+        self.assertEqual(cookie.value, body["csrf"])
+        self.assertNotIn("HttpOnly", cookie.output())  # фронт читает куку из JS
+        self.assertIn("Lax", cookie.output())
+
+    def test_unsafe_request_without_csrf_is_403(self):
+        response = self.client.post("/api/auth/login/", {"email": "a@b.uz", "password": "x"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "CSRF-токен не совпал. Обновите страницу.")
+
+    def test_csrf_header_must_match_cookie(self):
+        token = csrf_of(self.client)
         response = self.client.post(
-            "/api/auth/refresh/",
-            data="",
-            content_type="application/x-www-form-urlencoded",
+            "/api/auth/login/", {"email": "a@b.uz", "password": "x"}, format="json", HTTP_X_CSRFTOKEN="wrong"
         )
-        self.assertEqual(response.status_code, 204)
-
-    def test_refresh_accepts_no_body_and_updates_access_cookie(self):
-        before = self.client.cookies["uzum_access_token"].value
-        response = self.client.post("/api/auth/refresh/")
-        self.assertEqual(response.status_code, 204)
-        self.assertNotEqual(self.client.cookies["uzum_access_token"].value, before)
-
-    def test_refresh_body_token_takes_precedence_over_cookie(self):
-        """Явный refresh в теле важнее cookie: битый токен не должен «проходить» за счёт cookie."""
-        register(self.client, email="body@example.com")
-        cookie_value = self.client.cookies["uzum_refresh_token"].value
-        self.client.cookies["uzum_refresh_token"] = "garbage"
-        # 1) валидный токен в теле + битая cookie -> успех (приоритет у тела)
-        ok = self.client.post("/api/auth/refresh/", data={"refresh": cookie_value}, format="json")
-        self.assertEqual(ok.status_code, 204)
-        # 2) тело без refresh -> читаем cookie (в jar после шага 1 лежит ротированный refresh)
-        self.assertEqual(self.client.post("/api/auth/refresh/").status_code, 204)
-        # 3) битый токен в теле + валидная cookie -> 401, а не тихий 204; cookies сбрасываются
-        bad = self.client.post("/api/auth/refresh/", data={"refresh": "garbage"}, format="json")
-        self.assertEqual(bad.status_code, 401)
-        self.assertEqual(self.client.cookies["uzum_refresh_token"].value, "")
-
-    def test_refresh_without_cookie_clears_cookies(self):
-        self.client.cookies.clear()
-        response = self.client.post("/api/auth/refresh/")
+        self.assertEqual(response.status_code, 403)
+        response = self.client.post(
+            "/api/auth/login/", {"email": "a@b.uz", "password": "x"}, format="json", HTTP_X_CSRFTOKEN=token
+        )
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.json()["detail"], "Refresh token not found in cookies.")
-
-    def test_logout_blacklists_refresh_token(self):
-        """AUDIT A-5: logout обязан отозвать refresh, а не только стереть cookies."""
-        self.assertEqual(BlacklistedToken.objects.count(), 0)
-        response = self.client.post("/api/auth/logout/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(BlacklistedToken.objects.count(), 1)
-        # и после этого refresh больше не работает
-        self.assertEqual(self.client.post("/api/auth/refresh/").status_code, 401)
-
-    def test_logout_allowed_without_valid_access_token(self):
-        """Logout не должен требовать живой access, иначе cookie не очистить."""
-        self.client.cookies["uzum_access_token"] = "garbage"
-        self.assertEqual(self.client.post("/api/auth/logout/").status_code, 200)
-
-    def test_rotation_invalidates_old_refresh_cookie(self):
-        """ROTATE_REFRESH_TOKENS=True: старый refresh после ротации не работает."""
-        old_refresh = self.client.cookies["uzum_refresh_token"].value
-        self.assertEqual(self.client.post("/api/auth/refresh/").status_code, 204)
-        from rest_framework_simplejwt.exceptions import TokenError
-        from rest_framework_simplejwt.tokens import RefreshToken
-
-        with self.assertRaises(TokenError):
-            RefreshToken(old_refresh)  # должен быть в блэклисте
-
-    def test_expired_access_token_yields_401_on_protected_only(self):
-        """AUDIT A-4: истёкший/битый токен = 401 на /me/, но 200 на публичном каталоге."""
-        self.client.cookies["uzum_access_token"] = "not-a-jwt"
-        self.assertEqual(self.client.get("/api/auth/me/").status_code, 401)
-        self.assertEqual(self.client.get("/api/products/").status_code, 200)
-        self.assertEqual(self.client.get("/api/categories/").status_code, 200)
 
 
-class MeViewTests(APITestCase):
+class LoginTests(TestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email="user@example.com", password=PASSWORD)
+        self.client = AuthClient()
+        self.user = make_user("buyer@test.uz")
 
-    def test_anonymous_401(self):
+    def test_login_sets_both_cookies_and_returns_profile(self):
+        response = self.client.login_as("buyer@test.uz")
+        body = response.json()
+        self.assertEqual(
+            sorted(body.keys()),
+            ["date_joined", "email", "first_name", "id", "is_seller", "last_name", "phone", "seller_id"],
+        )
+        self.assertTrue(response.cookies[settings.SESSION_COOKIE_NAME].value)
+        self.assertTrue(response.cookies[settings.CSRF_COOKIE_NAME].value)
+
+    def test_login_wrong_password_is_401_with_detail(self):
+        csrf = csrf_of(self.client)
+        response = self.client.post(
+            "/api/auth/login/",
+            {"email": "buyer@test.uz", "password": "nope-nope"},
+            format="json",
+            HTTP_X_CSRFTOKEN=csrf,
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Неверный email или пароль", response.json()["detail"])
+
+    def test_login_is_case_insensitive(self):
+        self.client.login_as("BUYER@test.uz")
+
+    def test_me_requires_session(self):
+        response = self.client.get("/api/auth/me/")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "Вы не авторизованы")
+
+    def test_me_returns_profile_with_session(self):
+        self.client.login_as("buyer@test.uz")
+        response = self.client.get("/api/auth/me/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["email"], "buyer@test.uz")
+
+    def test_logout_clears_session(self):
+        self.client.login_as("buyer@test.uz")
+        response = self.client.csrf_post("/api/auth/logout/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["detail"], "Вы вышли из аккаунта")
         self.assertEqual(self.client.get("/api/auth/me/").status_code, 401)
 
-    def test_bearer_token_supported(self):
-        """AUDIT B-2: заголовочный флоу должен работать (мобильные клиенты)."""
-        from rest_framework_simplejwt.tokens import RefreshToken
 
-        access = str(RefreshToken.for_user(self.user).access_token)
-        response = self.client.get("/api/auth/me/", headers={"authorization": f"Bearer {access}"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["email"], "user@example.com")
-
-    def test_inactive_user_rejected(self):
-        from rest_framework_simplejwt.tokens import RefreshToken
-
-        self.user.is_active = False
-        self.user.save(update_fields=["is_active"])
-        access = str(RefreshToken.for_user(self.user).access_token)
-        self.assertEqual(
-            self.client.get("/api/auth/me/", headers={"authorization": f"Bearer {access}"}).status_code, 401
-        )
-
-    def test_deleted_user_does_not_crash(self):
-        from rest_framework_simplejwt.tokens import RefreshToken
-
-        access = str(RefreshToken.for_user(self.user).access_token)
-        self.user.delete()
-        self.assertEqual(
-            self.client.get("/api/auth/me/", headers={"authorization": f"Bearer {access}"}).status_code, 401
-        )
-
-
-class EnsureSuperuserTests(TestCase):
-    """Идемпотентное создание/повышение суперюзера (build.sh, шаг «Суперюзер»).
-
-    Закрывает падение деплоя `CommandError: That Email is already taken.`:
-    раньше build.sh парсил stdout `manage.py shell -c` (где баннер засорял вывод),
-    поэтому guard никогда не срабатывал и деплой уходил в `createsuperuser --noinput`,
-    который бросал CommandError на уже существующем email.
-    """
-
-    def _call(self, **opts):
-        out = io.StringIO()
-        call_command("ensure_superuser", stdout=out, **opts)
-        return out.getvalue()
-
+class RegisterTests(TestCase):
     def setUp(self):
-        User.objects.all().delete()
+        self.client = AuthClient()
 
-    def test_creates_superuser_when_absent(self):
-        self._call(email="boss@example.com", password=PASSWORD, first_name="Bob")
-        user = User.objects.get(email="boss@example.com")
-        self.assertTrue(user.is_staff)
-        self.assertTrue(user.is_superuser)
-        self.assertTrue(user.check_password(PASSWORD))
-        self.assertEqual(user.first_name, "Bob")
+    def register(self, payload):
+        return self.client.csrf_post("/api/auth/register/", payload)
 
-    def test_repeated_run_is_noop_and_keeps_password(self):
-        self._call(email="boss@example.com", password=PASSWORD)
-        user = User.objects.get(email="boss@example.com")
-        before = user.password
-        out = self._call(email="boss@example.com", password="another-new-password-123")
-        self.assertEqual(User.objects.count(), 1)
-        user.refresh_from_db()
-        self.assertEqual(user.password, before)  # пароль без --update-password не трогаем
-        self.assertIn("уже в порядке", out)
+    def test_register_creates_user_and_shop(self):
+        response = self.register(
+            {
+                "email": "New@User.UZ",
+                "password": PASSWORD,
+                "password2": PASSWORD,
+                "first_name": "Сардор",
+                "last_name": "Каримов",
+                "phone": "+998901112233",
+            }
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        body = response.json()
+        self.assertEqual(body["email"], "new@user.uz")
+        self.assertTrue(body["is_seller"])
+        self.assertIsNotNone(body["seller_id"])
+        # магазин «1 к 1», имя по умолчанию «<имя> — магазин»
+        from apps.products.models import Seller
 
-    def test_legacy_mixed_case_email_is_promoted_and_normalized(self):
-        # «Наследный» профиль с email в смешанном регистре (записан до нормализации).
-        user = User.objects.create_user(email="admin@example.com", password=PASSWORD)
-        User.objects.filter(pk=user.pk).update(email="Admin@Example.com")
-        count_before = User.objects.count()
+        seller = Seller.objects.get(pk=body["seller_id"])
+        self.assertEqual(seller.name, "Сардор — магазин")
+        self.assertEqual(seller.city, "Ташкент")
+        # куки стоят сразу
+        self.assertEqual(self.client.get("/api/auth/me/").status_code, 200)
 
-        out = self._call(email="Admin@Example.com", password=PASSWORD)
-        User.objects.get(email="admin@example.com")  # нормализован, не дубль
-        self.assertEqual(User.objects.count(), count_before)
-        refreshed = User.objects.get(pk=user.pk)
-        self.assertTrue(refreshed.is_staff)
-        self.assertTrue(refreshed.is_superuser)
-        self.assertEqual(refreshed.email, "admin@example.com")
-        self.assertTrue(refreshed.check_password(PASSWORD))  # хэш не сброшен
-        self.assertIn("обновлён", out)
+    def test_register_with_shop_name(self):
+        response = self.register(
+            {
+                "email": "a@b.uz",
+                "password": PASSWORD,
+                "password2": PASSWORD,
+                "first_name": "Имя",
+                "shop_name": "Моя мастерская",
+            }
+        )
+        from apps.products.models import Seller
 
-    def test_update_password_changes_existing_password(self):
-        self._call(email="boss@example.com", password=PASSWORD)
-        user = User.objects.get(email="boss@example.com")
-        self._call(email="boss@example.com", password="brand-new-Pass-42", update_password=True)
-        user.refresh_from_db()
-        self.assertTrue(user.check_password("brand-new-Pass-42"))
-        self.assertFalse(user.check_password(PASSWORD))
+        seller = Seller.objects.get(pk=response.json()["seller_id"])
+        self.assertEqual(seller.name, "Моя мастерская")
+        self.assertNotIn(" ", seller.slug)
 
-    def test_empty_email_is_skipped(self):
-        from unittest.mock import patch
+    def test_register_validation_fields(self):
+        response = self.register(
+            {
+                "email": "not-an-email",
+                "password": "short",
+                "password2": "other",
+                "first_name": "И",
+            }
+        )
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertIn("detail", body)
+        fields = body.get("fields", {})
+        for key in ("email", "password", "password2", "first_name"):
+            self.assertIn(key, fields)
+            self.assertIsInstance(fields[key], str)
 
-        # build.sh полагается на env-путь: DJANGO_SUPERUSER_EMAIL пуст → пропуск, rc 0.
-        with patch.dict("os.environ", {"DJANGO_SUPERUSER_EMAIL": ""}, clear=False):
-            out = self._call()
-        self.assertEqual(User.objects.count(), 0)
-        self.assertIn("не задан", out)
+    def test_register_duplicate_email(self):
+        make_user("dup@test.uz")
+        response = self.register(
+            {"email": "DUP@test.uz", "password": PASSWORD, "password2": PASSWORD, "first_name": "Имя"}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("email", response.json()["fields"])
 
-    def test_create_without_password_raises_command_error(self):
-        with self.assertRaises(CommandError):
-            self._call(email="boss@example.com", password="")
+
+class MePatchTests(TestCase):
+    def setUp(self):
+        self.client = AuthClient()
+        make_user("me@test.uz", first_name="Старое")
+        self.client.login_as("me@test.uz")
+
+    def test_patch_updates_fields(self):
+        response = self.client.csrf_patch("/api/auth/me/", {"first_name": "Новое", "phone": "+998901234567"})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["first_name"], "Новое")
+        self.assertEqual(body["phone"], "+998901234567")
+
+    def test_patch_email_conflict(self):
+        make_user("other@test.uz")
+        response = self.client.csrf_patch("/api/auth/me/", {"email": "other@test.uz"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("email", response.json()["fields"])
+
+
+class PasswordTests(TestCase):
+    def setUp(self):
+        self.client = AuthClient()
+        make_user("pwd@test.uz")
+        self.client.login_as("pwd@test.uz")
+
+    def test_password_change_and_other_sessions_invalidated(self):
+        # вторая сессия того же пользователя
+        other = AuthClient()
+        other.login_as("pwd@test.uz")
+        self.assertEqual(other.get("/api/auth/me/").status_code, 200)
+
+        response = self.client.csrf_post("/api/auth/password/", {"current": PASSWORD, "next": "NewPassword456"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["detail"], "Пароль обновлён")
+
+        # текущая сессия жива, вторая — мертва
+        self.assertEqual(self.client.get("/api/auth/me/").status_code, 200)
+        self.assertEqual(other.get("/api/auth/me/").status_code, 401)
+        # новый пароль работает
+        fresh = AuthClient()
+        fresh.login_as("pwd@test.uz", "NewPassword456")
+
+    def test_password_wrong_current(self):
+        response = self.client.csrf_post("/api/auth/password/", {"current": "wrong-pass", "next": "NewPassword456"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("current", response.json()["fields"])
+
+    def test_password_too_short(self):
+        response = self.client.csrf_post("/api/auth/password/", {"current": PASSWORD, "next": "short"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("next", response.json()["fields"])
+
+
+class ThrottleTests(TestCase):
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()  # locmem общий на процесс: история троттлинга не должна течь между тестами
+
+    def test_login_throttled_by_ip(self):
+        from django.test import override_settings
+
+        client = AuthClient()
+        csrf = csrf_of(client)
+        with override_settings(
+            REST_FRAMEWORK={
+                **settings.REST_FRAMEWORK,
+                "DEFAULT_THROTTLE_RATES": {**settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"], "login": "3/min"},
+            }
+        ):
+            codes = [
+                client.post(
+                    "/api/auth/login/",
+                    {"email": "x@y.uz", "password": "bad-pass-1"},
+                    format="json",
+                    HTTP_X_CSRFTOKEN=csrf,
+                ).status_code
+                for _ in range(5)
+            ]
+        self.assertEqual(codes[:3], [401, 401, 401])
+        self.assertEqual(codes[3], 429)
+
+
+class SessionHousekeepingTests(TestCase):
+    def test_sessions_live_in_db_and_expire(self):
+        self.assertEqual(Session.objects.count(), 0)
+        client = AuthClient()
+        make_user("s@test.uz")
+        client.login_as("s@test.uz")
+        self.assertEqual(Session.objects.count(), 1)
+        session = Session.objects.first()
+        decoded = session.get_decoded()
+        self.assertEqual(decoded["_auth_user_id"], str(User.objects.get(email="s@test.uz").pk))

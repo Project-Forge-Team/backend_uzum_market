@@ -1,263 +1,217 @@
-"""Наполнение БД демо-данными.
+"""Сид демо-данных (§9 ТЗ).
 
-Флаги:
-  --force         пересоздать товары, даже если они уже есть
-  --fix-encoding  разово прогнать починку «битой» кодировки (см. ниже)
+    python manage.py seed              # залить, если БД пуста (иначе выйти)
+    python manage.py seed --force      # залить даже если данные есть (добавляет недостающее)
+    python manage.py seed --reset      # стереть данные каталога/заказов и залить заново
 
-Раньше исправление кодировки запускалось ВСЕГДА, то есть на каждый деплой в build.sh
-это был полный скан всей таблицы товаров (на 20k строк ~1 с и вся таблица в памяти,
-на 1M — минуты). Починка данных — разовая операция, она не должна жить в цикле деплоя.
+POST /api/demo/reset/ вызывает этот же код с reset=True.
 """
 
+from datetime import timedelta
+
+from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.db.models import F
+from django.utils import timezone
 
-from apps.products.models import Category, Product, Seller
+from apps.orders.models import Order, OrderEvent, OrderItem, PromoCode
+from apps.orders.services import calc_totals, generate_number
 
-CATEGORIES = [
-    {"name": "Электроника", "slug": "electronics"},
-    {"name": "Одежда", "slug": "clothing"},
-    {"name": "Дом и сад", "slug": "home-garden"},
-    {"name": "Красота", "slug": "beauty"},
-    {"name": "Спорт", "slug": "sport"},
-]
+from ... import dataset as _dataset
+from ...dataset import CATEGORIES, DEMO_ORDERS, DEMO_PASSWORD, DEMO_USERS, DRAFT_PRODUCT, PRODUCTS, PROMO_CODES
+from ...gen_media import write_svg
+from ...models import Category, Product, Review, Seller
+from ...services import recompute_product_reviews, recompute_seller_reviews
+from ...translit import unique_slug
 
-SELLERS = [
-    {"name": "Uzum Market Official", "rating": "4.80", "reviews_count": 1520},
-    {"name": "TechStore", "rating": "4.50", "reviews_count": 340},
-    {"name": "FashionHub", "rating": "4.70", "reviews_count": 890},
-    {"name": "HomeComfort", "rating": "4.30", "reviews_count": 210},
-]
+REVIEWS = _dataset.reviews()
 
-PRODUCTS = [
-    {
-        "title": "Беспроводные наушники Apple AirPods Pro 2, MagSafe Type-C",
-        "description": (
-            "Наушники AirPods Pro 2 с активным шумоподавлением до 2 раз эффективнее. "
-            "Режим прозрачности позволяет слышать окружающий мир."
-        ),
-        "price": "3190000.00",
-        "old_price": "3600000.00",
-        "rating": "4.95",
-        "reviews_count": 450,
-        "monthly_payment": "265833.00",
-        "delivery_time": "1 день",
-        "image": "https://picsum.photos/seed/airpods/600/600",
-        "images": [
-            "https://picsum.photos/seed/airpods1/600/600",
-            "https://picsum.photos/seed/airpods2/600/600",
-        ],
-        "characteristics": {
-            "Время работы": "До 6 часов",
-            "Разъём зарядки": "USB Type-C",
-            "Шумоподавление": "Активное (ANC)",
-            "Тип подключения": "Беспроводное Bluetooth 5.3",
-        },
-        "is_ad": True,
-        "category_slug": "electronics",
-        "seller_name": "TechStore",
-    },
-    {
-        "title": "Смартфон Samsung Galaxy A55 5G 8/256GB",
-        "description": 'Смартфон Samsung Galaxy A55 с поддержкой 5G. Экран Super AMOLED 6.6" 120Hz.',
-        "price": "4990000.00",
-        "old_price": "5500000.00",
-        "rating": "4.80",
-        "reviews_count": 320,
-        "monthly_payment": "415833.00",
-        "delivery_time": "1-2 дня",
-        "image": "https://picsum.photos/seed/a55/600/600",
-        "images": ["https://picsum.photos/seed/a551/600/600", "https://picsum.photos/seed/a552/600/600"],
-        "characteristics": {
-            "Экран": '6.6" Super AMOLED 120Hz',
-            "Память": "8/256GB",
-            "Камера": "50+12+5 Мп",
-            "Батарея": "5000 мАч",
-        },
-        "is_ad": True,
-        "category_slug": "electronics",
-        "seller_name": "Uzum Market Official",
-    },
-    {
-        "title": "Куртка зимняя мужская пуховик оверсайз",
-        "description": "Тёплая зимняя куртка с натуральным пухом. Водоотталкивающая ткань.",
-        "price": "890000.00",
-        "old_price": "1200000.00",
-        "rating": "4.60",
-        "reviews_count": 180,
-        "monthly_payment": "74166.00",
-        "delivery_time": "2-3 дня",
-        "image": "https://picsum.photos/seed/jacket/600/600",
-        "images": ["https://picsum.photos/seed/jacket1/600/600"],
-        "characteristics": {
-            "Сезон": "Зима",
-            "Наполнитель": "Натуральный пух",
-            "Температурный режим": "до -25°C",
-        },
-        "is_ad": False,
-        "category_slug": "clothing",
-        "seller_name": "FashionHub",
-    },
-    {
-        "title": "Робот-пылесос Xiaomi Robot Vacuum S20+",
-        "description": "Робот-пылесос Xiaomi с лидарной навигацией. Влажная уборка.",
-        "price": "2150000.00",
-        "old_price": None,
-        "rating": "4.70",
-        "reviews_count": 240,
-        "monthly_payment": "179166.00",
-        "delivery_time": "1-3 дня",
-        "image": "https://picsum.photos/seed/vacuum/600/600",
-        "images": ["https://picsum.photos/seed/vacuum1/600/600"],
-        "characteristics": {
-            "Тип уборки": "Сухая и влажная",
-            "Навигация": "Лидар",
-            "Время работы": "до 130 минут",
-        },
-        "is_ad": False,
-        "category_slug": "home-garden",
-        "seller_name": "HomeComfort",
-    },
-    {
-        "title": "Кроссовки Nike Air Force 1 '07",
-        "description": "Классические кроссовки Nike Air Force 1. Верх из натуральной кожи.",
-        "price": "1290000.00",
-        "old_price": "1490000.00",
-        "rating": "4.90",
-        "reviews_count": 560,
-        "monthly_payment": "107500.00",
-        "delivery_time": "2-4 дня",
-        "image": "https://picsum.photos/seed/nike/600/600",
-        "images": ["https://picsum.photos/seed/nike1/600/600", "https://picsum.photos/seed/nike2/600/600"],
-        "characteristics": {
-            "Верх": "Натуральная кожа",
-            "Амортизация": "Air",
-            "Подошва": "Резина",
-        },
-        "is_ad": True,
-        "category_slug": "sport",
-        "seller_name": "FashionHub",
-    },
-    {
-        "title": "Фен Dyson Supersonic HD08",
-        "description": "Фен Dyson Supersonic с цифровым мотором V9. Ионизация.",
-        "price": "3490000.00",
-        "old_price": "3990000.00",
-        "rating": "4.85",
-        "reviews_count": 190,
-        "monthly_payment": "290833.00",
-        "delivery_time": "1-2 дня",
-        "image": "https://picsum.photos/seed/dyson/600/600",
-        "images": ["https://picsum.photos/seed/dyson1/600/600"],
-        "characteristics": {
-            "Мощность": "1600 Вт",
-            "Мотор": "Цифровой V9",
-            "Ионизация": "Да",
-        },
-        "is_ad": False,
-        "category_slug": "beauty",
-        "seller_name": "Uzum Market Official",
-    },
-]
+User = get_user_model()
 
-
-def fix_mojibake(value):
-    """UTF-8 байты, прочитанные как Latin-1 → обратно в нормальный текст.
-
-    Возвращает (исправлено_или_нет, значение). Строку, которую нельзя декодировать
-    как latin-1, не трогаем: это уже нормальный текст.
-    """
-    if not isinstance(value, str) or not value:
-        return False, value
-    try:
-        fixed = value.encode("latin-1").decode("utf-8")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return False, value
-    return (fixed != value), fixed
+EMOJI_BY_CATEGORY = {slug: emoji for _, slug, emoji, _ in CATEGORIES}
 
 
 class Command(BaseCommand):
-    help = "Заполняет БД демо-данными (категории, продавцы, товары)."
+    help = "Демо-данные маркетплейса: категории, магазины, товары, отзывы, заказы"
 
     def add_arguments(self, parser):
-        parser.add_argument("--force", action="store_true", help="Залить данные даже если товары уже есть")
-        parser.add_argument("--fix-encoding", action="store_true", help="Разово починить битую кодировку в текстах")
-        parser.add_argument("--reset", action="store_true", help="Удалить демо-данные перед заполнением")
+        parser.add_argument("--reset", action="store_true", help="стереть данные и залить сид")
+        parser.add_argument("--force", action="store_true", help="заливать, даже если данные уже есть")
 
     def handle(self, *args, **options):
-        if options["fix_encoding"]:
-            self._fix_encoding()
+        reset = options["reset"]
+        force = options["force"]
 
-        if not options["force"] and Product.objects.exists():
-            self.stdout.write(self.style.WARNING("Товары уже есть — пропуск (используйте --force)."))
+        if reset:
+            self._wipe()
+        elif not force and (Product.objects.exists() or Category.objects.exists()):
+            self.stdout.write("Демо-данные уже есть — пропускаю (seed --reset, чтобы пересоздать).")
             return
 
         with transaction.atomic():
-            if options["reset"]:
-                Product.objects.all().delete()
-                Category.objects.all().delete()
-                Seller.objects.all().delete()
-                self.stdout.write("Старые данные удалены.")
+            self._seed()
+        self.stdout.write(self.style.SUCCESS("Демо-данные готовы."))
 
-            categories = {
-                row["slug"]: Category.objects.get_or_create(slug=row["slug"], defaults=row)[0] for row in CATEGORIES
-            }
-            sellers = {
-                row["name"]: Seller.objects.update_or_create(name=row["name"], defaults=row)[0] for row in SELLERS
-            }
+    def _wipe(self):
+        # Сессии и суперюзеров не трогаем: сброс — про демо-контент.
+        Order.objects.all().delete()
+        Review.objects.all().delete()
+        Product.objects.all().delete()
+        Seller.objects.all().delete()
+        Category.objects.all().delete()
+        PromoCode.objects.all().delete()
+        User.objects.filter(is_staff=False, is_superuser=False).delete()
+        self.stdout.write("Старые данные удалены.")
 
-            created = 0
-            for payload in PRODUCTS:
-                data = dict(payload)
-                slug = data.pop("category_slug")
-                seller_name = data.pop("seller_name")
-                _, was_created = Product.objects.get_or_create(
-                    title=data["title"],
-                    defaults={**data, "category": categories.get(slug), "seller": sellers.get(seller_name)},
-                )
-                created += int(was_created)
+    def _seed(self):
+        now = timezone.now()
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Seed завершён: товаров создано {created}, категорий {len(categories)}, продавцов {len(sellers)}."
+        categories = {}
+        for name, slug, emoji, color in CATEGORIES:
+            categories[slug] = Category.objects.create(name=name, slug=slug, emoji=emoji, color=color)
+
+        sellers = {}
+        for name, slug, city, description, verified in _dataset.SELLERS:
+            sellers[slug] = Seller.objects.create(
+                name=name, slug=slug, city=city, description=description, verified=verified
             )
+
+        users = {}
+        for email, first_name, last_name, phone, seller_slug in DEMO_USERS:
+            user = User.objects.create(
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                phone=phone,
+                is_active=True,
+            )
+            user.set_password(DEMO_PASSWORD)
+            user.save(update_fields=["password", "password_updated_at"])
+            users[email] = user
+            if seller_slug:
+                sellers[seller_slug].owner = user
+                sellers[seller_slug].save(update_fields=["owner"])
+
+        buyer = users["buyer@uzum.uz"]
+
+        def create_product(spec, status):
+            (
+                seller_slug,
+                title,
+                category_slug,
+                brand,
+                price,
+                old_price,
+                stock,
+                is_ad,
+                delivery,
+                characteristics,
+                days_ago,
+            ) = spec
+            slug = unique_slug(Product, title, max_length=140)
+            images = [f"/products/gen/{slug}-1.svg", f"/products/gen/{slug}-2.svg"]
+            for i, image in enumerate(images):
+                write_svg(image.removeprefix("/products/gen/"), EMOJI_BY_CATEGORY[category_slug], brand, i)
+            views = 40 + (sum(ord(c) for c in title) % 900)
+            return Product.objects.create(
+                seller=sellers[seller_slug],
+                category=categories[category_slug],
+                slug=slug,
+                title=title,
+                description=(
+                    f"{title} — проверенный товар магазина {sellers[seller_slug].name}. "
+                    f"Доставка по Ташкенту {delivery.lower()}, возврат 14 дней. "
+                    "Товар прошёл проверку перед отправкой, комплектация соответствует описанию."
+                ),
+                price=price,
+                old_price=old_price,
+                stock=stock,
+                brand=brand,
+                delivery_time=delivery,
+                is_ad=is_ad,
+                status=status,
+                views=views,
+                images=images,
+                characteristics=characteristics,
+                created_at=now - timedelta(days=days_ago),
+            )
+
+        products = [create_product(spec, Product.Status.ACTIVE) for spec in PRODUCTS]
+        create_product(DRAFT_PRODUCT, Product.Status.DRAFT)
+
+        # Отзывы: ровно 2 на товар; отзыв покупателя (товар 0) привязан к аккаунту buyer.
+        for product_index, rows in REVIEWS.items():
+            product = products[product_index]
+            for row_index, (author, rating, text, pros, cons, seller_reply, verified) in enumerate(rows):
+                is_buyer_review = product_index == 0 and row_index == 0
+                Review.objects.create(
+                    product=product,
+                    user=buyer if is_buyer_review else None,
+                    author=author,
+                    rating=rating,
+                    text=text,
+                    pros=pros,
+                    cons=cons,
+                    verified=verified or is_buyer_review,
+                    seller_reply=seller_reply,
+                    created_at=now - timedelta(days=product_index % 30, hours=row_index * 3),
+                )
+            recompute_product_reviews(product)
+
+        for promo_args in PROMO_CODES:
+            PromoCode.objects.create(
+                code=promo_args[0], percent=promo_args[1], min_subtotal=promo_args[2], label=promo_args[3]
+            )
+
+        # Демо-заказы покупателя (§9 ТЗ): суммы считает тот же код, что и в API.
+        for spec in DEMO_ORDERS:
+            created_at = now - timedelta(days=spec["days_ago"])
+            items = [(products[item["product"]], item["qty"]) for item in spec["items"]]
+            subtotal = sum(int(product.price) * qty for product, qty in items)
+            totals = calc_totals(subtotal, spec["delivery_method"], spec.get("promo_code"))
+            order = Order.objects.create(
+                number=generate_number(),
+                user=buyer,
+                status=spec["status"],
+                subtotal=subtotal,
+                discount=totals["discount"],
+                promo_code=spec.get("promo_code") if totals["promo_valid"] else None,
+                delivery_cost=totals["delivery_cost"],
+                total=totals["total"],
+                address=spec["address"],
+                pickup_point="",
+                delivery_method=spec["delivery_method"],
+                payment_method=spec["payment_method"],
+                comment=spec["comment"],
+                created_at=created_at,
+            )
+            for product, qty in items:
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    title=product.title,
+                    image=product.image,
+                    price=product.price,
+                    qty=qty,
+                    seller=product.seller,
+                )
+                Product.objects.filter(pk=product.pk).update(stock=F("stock") - qty)
+            for status, days_ago, note in spec["events"]:
+                OrderEvent.objects.create(
+                    order=order,
+                    status=status,
+                    at=now - timedelta(days=days_ago),
+                    note=note,
+                )
+
+        for seller in sellers.values():
+            recompute_seller_reviews(seller)
+
+        counts = (
+            f"Категорий: {Category.objects.count()}, магазинов: {Seller.objects.count()}, "
+            f"товаров: {Product.objects.count()} (в т.ч. черновик), отзывов: {Review.objects.count()}, "
+            f"заказов: {Order.objects.count()}"
         )
-
-    def _fix_encoding(self):
-        """Однократная починка, а не «на каждый деплой». Только --fix-encoding."""
-        text_fields = ["title", "description", "delivery_time"]
-        fixed_products = 0
-        # iterator(): не держим всю таблицу в памяти
-        for product in Product.objects.only(*text_fields, "characteristics").iterator(chunk_size=2000):
-            changed = False
-            for field in text_fields:
-                was_fixed, value = fix_mojibake(getattr(product, field))
-                if was_fixed:
-                    setattr(product, field, value)
-                    changed = True
-            if isinstance(product.characteristics, dict):
-                new_chars = {}
-                for key, val in product.characteristics.items():
-                    _, new_key = fix_mojibake(key)
-                    _, new_val = fix_mojibake(val)
-                    new_chars[new_key] = new_val
-                if new_chars != product.characteristics:
-                    product.characteristics = new_chars
-                    changed = True
-            if changed:
-                product.save(update_fields=[*text_fields, "characteristics"])
-                fixed_products += 1
-
-        for model, fields in ((Category, ["name"]), (Seller, ["name"])):
-            for obj in model.objects.all():
-                changed = False
-                for field in fields:
-                    was_fixed, value = fix_mojibake(getattr(obj, field))
-                    if was_fixed:
-                        setattr(obj, field, value)
-                        changed = True
-                if changed:
-                    obj.save(update_fields=fields)
-                    fixed_products += 1
-
-        self.stdout.write(self.style.SUCCESS(f"Кодировка: исправлено объектов — {fixed_products}."))
+        self.stdout.write(counts)
+        self.stdout.write(f"Демо-аккаунты (пароль {DEMO_PASSWORD}): " + ", ".join(users))
