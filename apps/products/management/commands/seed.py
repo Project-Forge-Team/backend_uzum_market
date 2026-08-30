@@ -55,12 +55,20 @@ class Command(BaseCommand):
 
     def _wipe(self):
         # Сессии и суперюзеров не трогаем: сброс — про демо-контент.
+        OrderItem.objects.all().delete()
+        OrderEvent.objects.all().delete()
         Order.objects.all().delete()
         Review.objects.all().delete()
         Product.objects.all().delete()
         Seller.objects.all().delete()
         Category.objects.all().delete()
         PromoCode.objects.all().delete()
+        try:
+            from apps.uploads.models import MediaFile
+
+            MediaFile.objects.all().delete()
+        except Exception:
+            pass
         User.objects.filter(is_staff=False, is_superuser=False).delete()
         self.stdout.write("Старые данные удалены.")
 
@@ -69,13 +77,17 @@ class Command(BaseCommand):
 
         categories = {}
         for name, slug, emoji, color in CATEGORIES:
-            categories[slug] = Category.objects.create(name=name, slug=slug, emoji=emoji, color=color)
+            cat, _ = Category.objects.update_or_create(
+                slug=slug, defaults={"name": name, "emoji": emoji, "color": color}
+            )
+            categories[slug] = cat
 
         sellers = {}
         for name, slug, city, description, verified in _dataset.SELLERS:
-            sellers[slug] = Seller.objects.create(
-                name=name, slug=slug, city=city, description=description, verified=verified
+            sel, _ = Seller.objects.update_or_create(
+                slug=slug, defaults={"name": name, "city": city, "description": description, "verified": verified}
             )
+            sellers[slug] = sel
 
         users = {}
         for email, first_name, last_name, phone, seller_slug in DEMO_USERS:
@@ -189,8 +201,9 @@ class Command(BaseCommand):
             recompute_product_reviews(product)
 
         for promo_args in PROMO_CODES:
-            PromoCode.objects.create(
-                code=promo_args[0], percent=promo_args[1], min_subtotal=promo_args[2], label=promo_args[3]
+            PromoCode.objects.update_or_create(
+                code=promo_args[0],
+                defaults={"percent": promo_args[1], "min_subtotal": promo_args[2], "label": promo_args[3]},
             )
 
         # Демо-заказы покупателя (§9 ТЗ): суммы считает тот же код, что и в API.
