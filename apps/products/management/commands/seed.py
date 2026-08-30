@@ -79,15 +79,22 @@ class Command(BaseCommand):
 
         users = {}
         for email, first_name, last_name, phone, seller_slug in DEMO_USERS:
-            user = User.objects.create(
-                email=email,
-                first_name=first_name,
-                last_name=last_name,
-                phone=phone,
-                is_active=True,
-            )
+            user = User.objects.filter(email__iexact=email).first()
+            if not user:
+                user = User.objects.create(
+                    email=email,
+                    first_name=first_name,
+                    last_name=last_name,
+                    phone=phone,
+                    is_active=True,
+                )
+            else:
+                user.first_name = first_name
+                user.last_name = last_name
+                user.phone = phone
+                user.is_active = True
             user.set_password(DEMO_PASSWORD)
-            user.save(update_fields=["password", "password_updated_at"])
+            user.save()
             users[email] = user
             if seller_slug:
                 sellers[seller_slug].owner = user
