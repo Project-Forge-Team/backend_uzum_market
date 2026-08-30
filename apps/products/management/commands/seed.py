@@ -96,30 +96,52 @@ class Command(BaseCommand):
         buyer = users["buyer@uzum.uz"]
 
         def create_product(spec, status):
-            (
-                seller_slug,
-                title,
-                category_slug,
-                brand,
-                price,
-                old_price,
-                stock,
-                is_ad,
-                delivery,
-                characteristics,
-                days_ago,
-            ) = spec
+            if len(spec) == 13:
+                (
+                    seller_slug,
+                    title,
+                    category_slug,
+                    brand,
+                    price,
+                    old_price,
+                    stock,
+                    is_ad,
+                    delivery,
+                    characteristics,
+                    days_ago,
+                    images,
+                    description,
+                ) = spec
+            else:
+                (
+                    seller_slug,
+                    title,
+                    category_slug,
+                    brand,
+                    price,
+                    old_price,
+                    stock,
+                    is_ad,
+                    delivery,
+                    characteristics,
+                    days_ago,
+                ) = spec
+                images = None
+                description = None
+
             slug = unique_slug(Product, title, max_length=140)
-            images = [f"/products/gen/{slug}-1.svg", f"/products/gen/{slug}-2.svg"]
-            for i, image in enumerate(images):
-                write_svg(image.removeprefix("/products/gen/"), EMOJI_BY_CATEGORY[category_slug], brand, i)
+            if not images:
+                images = [f"/products/gen/{slug}-1.svg", f"/products/gen/{slug}-2.svg"]
+                for i, image in enumerate(images):
+                    write_svg(image.removeprefix("/products/gen/"), EMOJI_BY_CATEGORY[category_slug], brand, i)
             views = 40 + (sum(ord(c) for c in title) % 900)
             return Product.objects.create(
                 seller=sellers[seller_slug],
                 category=categories[category_slug],
                 slug=slug,
                 title=title,
-                description=(
+                description=description
+                or (
                     f"{title} — проверенный товар магазина {sellers[seller_slug].name}. "
                     f"Доставка по Ташкенту {delivery.lower()}, возврат 14 дней. "
                     "Товар прошёл проверку перед отправкой, комплектация соответствует описанию."

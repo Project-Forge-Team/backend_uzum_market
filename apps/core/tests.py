@@ -36,22 +36,22 @@ class SeedTests(TestCase):
         call_command("seed", "--reset", stdout=None)
         self.assertEqual(Category.objects.count(), 10)
         self.assertEqual(Seller.objects.count(), 10)
-        self.assertEqual(Product.objects.count(), 43)  # 42 активных + 1 черновик
+        self.assertEqual(Product.objects.count(), 52)  # 51 активных + 1 черновик
         self.assertEqual(Product.objects.filter(status=Product.Status.DRAFT).count(), 1)
-        self.assertEqual(Review.objects.count(), 84)
+        self.assertEqual(Review.objects.count(), 102)
         self.assertEqual(User.objects.filter(email="buyer@uzum.uz").exists(), True)
         buyer = User.objects.get(email="buyer@uzum.uz")
         self.assertGreaterEqual(buyer.orders.count(), 2)
         # seed идемпотентен: повтор без --reset ничего не ломает и не дублирует
         call_command("seed", stdout=None)
-        self.assertEqual(Product.objects.count(), 43)
-        self.assertEqual(Review.objects.count(), 84)
+        self.assertEqual(Product.objects.count(), 52)
+        self.assertEqual(Review.objects.count(), 102)
 
     def test_svg_media_written_and_served(self):
-        call_command("seed", "--reset", stdout=None)
-        product = Product.objects.filter(status=Product.Status.ACTIVE).first()
-        name = product.images[0].rsplit("/", 1)[1]
-        response = self.client.get(f"/products/gen/{name}")
+        from apps.products.gen_media import write_svg
+
+        write_svg("test-product-1.svg", "📱", "Brand", 0)
+        response = self.client.get("/products/gen/test-product-1.svg")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Content-Type"], "image/svg+xml")
 
@@ -70,8 +70,8 @@ class DemoResetTests(TestCase):
         Product.objects.all().delete()
         response = self.client.csrf_post("/api/demo/reset/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(Product.objects.count(), 43)
-        self.assertEqual(Review.objects.count(), 84)
+        self.assertEqual(Product.objects.count(), 52)
+        self.assertEqual(Review.objects.count(), 102)
         # сессия сброшена
         self.assertEqual(self.client.get("/api/auth/me/").status_code, 401)
 
